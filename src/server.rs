@@ -586,7 +586,7 @@ async fn v1_chat_completions_handler(
     let forced_tool_name = req.forced_tool_name();
 
     if !req.stream.unwrap_or(false)
-        && let Some((tool_name, command)) = maybe_build_local_bash_tool_call(&req)
+        && let Some(tool_call) = maybe_build_local_tool_call_from_chat_request(&req)
     {
         let response = ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -603,8 +603,8 @@ async fn v1_chat_completions_handler(
                         id: format!("call_{}", uuid::Uuid::new_v4().simple()),
                         kind: "function",
                         function: AssistantToolCallFunction {
-                            name: tool_name,
-                            arguments: json!({"command": command}).to_string(),
+                            name: tool_call.name,
+                            arguments: tool_call.arguments,
                         },
                     }]),
                 },
@@ -1128,6 +1128,32 @@ async fn v1_messages_handler(
         (chars / 4) as u32 + 10 // +10 for structural overhead
     };
 
+    if !req.stream.unwrap_or(false)
+        && let Some(tool_call) = maybe_build_local_tool_call_from_claude_request(&req)
+    {
+        let tool_input: serde_json::Value =
+            serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
+        let response = ClaudeMessagesResponse {
+            id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
+            type_field: "message",
+            role: "assistant",
+            content: vec![ClaudeContentBlock {
+                type_field: "tool_use",
+                text: None,
+                id: Some(format!("toolu_{}", uuid::Uuid::new_v4().simple())),
+                name: Some(tool_call.name),
+                input: Some(tool_input),
+            }],
+            model: model.clone(),
+            stop_reason: "tool_use",
+            usage: ClaudeUsage {
+                input_tokens,
+                output_tokens: 0,
+            },
+        };
+        return (StatusCode::OK, Json(json!(response))).into_response();
+    }
+
     let cookie_values = {
         let cm = state.cookie_manager.read().await;
         cm.active_cookie_values()
@@ -1258,7 +1284,10 @@ async fn v1_messages_handler(
                             index: 0,
                             content_block: ClaudeContentBlock {
                                 type_field: "text",
-                                text: String::new(),
+                                text: Some(String::new()),
+                                id: None,
+                                name: None,
+                                input: None,
                             },
                         };
                         let data = serde_json::to_string(&block_start).unwrap_or_default();
@@ -1392,7 +1421,10 @@ async fn v1_messages_handler(
                     role: "assistant",
                     content: vec![ClaudeContentBlock {
                         type_field: "text",
-                        text: content,
+                        text: Some(content),
+                        id: None,
+                        name: None,
+                        input: None,
                     }],
                     model: model.clone(),
                     stop_reason: "end_turn",
@@ -1547,43 +1579,117 @@ fn truncate_for_error(input: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
-fn maybe_build_local_bash_tool_call(req: &ChatCompletionRequest) -> Option<(String, String)> {
-    let tool_names = req.requested_tool_names();
-    if !tool_names.iter().any(|name| name.eq_ignore_ascii_case("bash")) {
-        return None;
-    }
+#[derive(Debug)]
+struct LocalToolCall {
+    name: String,
+    arguments: String,
+}
 
+fn maybe_build_local_tool_call_from_chat_request(req: &ChatCompletionRequest) -> Option<LocalToolCall> {
+    let tool_names = req.requested_tool_names();
     let user_message = req
         .messages
         .iter()
         .rev()
         .find(|msg| msg.role.eq_ignore_ascii_case("user"))
         .map(|msg| msg.content.as_str())?;
+    maybe_build_local_tool_call(&tool_names, user_message)
+}
 
+fn maybe_build_local_tool_call_from_claude_request(
+    req: &ClaudeMessagesRequest,
+) -> Option<LocalToolCall> {
+    let tool_names = req.requested_tool_names();
+    let user_message = req
+        .messages
+        .iter()
+        .rev()
+        .find(|msg| msg.role.eq_ignore_ascii_case("user"))
+        .map(|msg| msg.content.as_str())?;
+    maybe_build_local_tool_call(&tool_names, user_message)
+}
+
+fn maybe_build_local_tool_call(tool_names: &[String], user_message: &str) -> Option<LocalToolCall> {
     let path = extract_file_path_from_text(user_message)?;
     let content = extract_write_content_from_text(user_message)?;
 
-    let parent = std::path::Path::new(&path)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .filter(|p| !p.is_empty())?;
+    let supports_bash = tool_names.iter().any(|name| name.eq_ignore_ascii_case("bash"));
+    let supports_write = tool_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("write") || name.eq_ignore_ascii_case("write_file"));
 
-    let command = format!(
-        "mkdir -p \"{}\" && printf %s \"{}\" > \"{}\"",
-        escape_shell_double_quotes(&parent),
-        escape_shell_double_quotes(&content),
-        escape_shell_double_quotes(&path)
-    );
+    if supports_bash {
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|p| !p.is_empty())?;
 
-    Some(("bash".to_string(), command))
+        let command = format!(
+            "mkdir -p \"{}\" && printf %s \"{}\" > \"{}\"",
+            escape_shell_double_quotes(&parent),
+            escape_shell_double_quotes(&content),
+            escape_shell_double_quotes(&path)
+        );
+        return Some(LocalToolCall {
+            name: "bash".to_string(),
+            arguments: json!({"command": command}).to_string(),
+        });
+    }
+
+    if supports_write {
+        return Some(LocalToolCall {
+            name: "write".to_string(),
+            arguments: json!({"filePath": path, "content": content}).to_string(),
+        });
+    }
+
+    None
 }
 
 fn extract_file_path_from_text(input: &str) -> Option<String> {
-    input
-        .split_whitespace()
-        .find(|token| token.starts_with('/') && token.contains('.') && !token.contains('"'))
-        .map(|token| token.trim_matches(|c| c == '，' || c == '。' || c == ',' || c == '.'))
-        .map(str::to_string)
+    let start = input.find("/home/")?;
+    let mut candidate = String::new();
+    for ch in input[start..].chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-') {
+            candidate.push(ch);
+        } else {
+            break;
+        }
+    }
+
+    if candidate.contains('.') && !candidate.ends_with('/') {
+        return Some(candidate);
+    }
+
+    let dir = if candidate.ends_with('/') {
+        candidate
+    } else if let Some(pos) = candidate.rfind('/') {
+        candidate[..=pos].to_string()
+    } else {
+        return None;
+    };
+
+    let filename = extract_filename_from_text(input)?;
+    Some(format!("{dir}{filename}"))
+}
+
+fn extract_filename_from_text(input: &str) -> Option<String> {
+    let mut current = String::new();
+    let mut candidates = Vec::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            current.push(ch);
+        } else {
+            if current.contains('.') {
+                candidates.push(current.clone());
+            }
+            current.clear();
+        }
+    }
+    if current.contains('.') {
+        candidates.push(current);
+    }
+    candidates.into_iter().find(|name| !name.starts_with('/'))
 }
 
 fn extract_write_content_from_text(input: &str) -> Option<String> {
@@ -1610,9 +1716,12 @@ fn now_ts() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_cookie_failure, maybe_build_local_bash_tool_call};
+    use super::{
+        classify_cookie_failure, maybe_build_local_tool_call_from_chat_request,
+        maybe_build_local_tool_call_from_claude_request,
+    };
     use crate::cookie_manager::CookieFailureKind;
-    use crate::models::ChatCompletionRequest;
+    use crate::models::{ChatCompletionRequest, ClaudeMessagesRequest};
 
     #[test]
     fn classify_cookie_failure_marks_auth_error_as_permanent() {
@@ -1646,9 +1755,48 @@ mod tests {
         }))
         .expect("request should deserialize");
 
-        let (tool, cmd) = maybe_build_local_bash_tool_call(&req).expect("tool call expected");
-        assert_eq!(tool, "bash");
-        assert!(cmd.contains("/home/nonewhite/Download/1234.txt"));
-        assert!(cmd.contains("printf %s \"123\""));
+        let tool_call = maybe_build_local_tool_call_from_chat_request(&req).expect("tool call expected");
+        assert_eq!(tool_call.name, "bash");
+        assert!(tool_call.arguments.contains("/home/nonewhite/Download/1234.txt"));
+        assert!(tool_call.arguments.contains("printf %s \\\"123\\\""));
+    }
+
+    #[test]
+    fn local_bash_tool_call_handles_no_whitespace_chinese_path_prompt() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "在/home/nonewhite/Download/中创建一个1234.txt文件并且在里面写入123"}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}
+            ],
+            "stream": false
+        }))
+        .expect("request should deserialize");
+
+        let tool_call = maybe_build_local_tool_call_from_chat_request(&req).expect("tool call expected");
+        assert_eq!(tool_call.name, "bash");
+        assert!(tool_call.arguments.contains("/home/nonewhite/Download/1234.txt"));
+    }
+
+    #[test]
+    fn claude_messages_can_generate_local_tool_use_call() {
+        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "帮我在 /home/nonewhite/Download/1234.txt 中写入 123"}
+            ],
+            "tools": [
+                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}}
+            ],
+            "max_tokens": 1024,
+            "stream": false
+        }))
+        .expect("request should deserialize");
+
+        let tool_call = maybe_build_local_tool_call_from_claude_request(&req).expect("tool call expected");
+        assert_eq!(tool_call.name, "bash");
+        assert!(tool_call.arguments.contains("/home/nonewhite/Download/1234.txt"));
     }
 }

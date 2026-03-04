@@ -424,7 +424,14 @@ pub struct ClaudeMessagesResponse {
 pub struct ClaudeContentBlock {
     #[serde(rename = "type")]
     pub type_field: &'static str,
-    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
