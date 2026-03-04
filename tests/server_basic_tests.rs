@@ -29,6 +29,18 @@ fn test_router_with_api_key() -> axum::Router {
     build_router(state)
 }
 
+fn test_router_with_invalid_upstream() -> axum::Router {
+    let state = build_state(Settings {
+        onyx_base_url: "http://127.0.0.1:9".to_string(),
+        onyx_auth_cookie: "test-cookie-1".to_string(),
+        request_timeout_secs: 1,
+        api_key: None,
+        ..Settings::default()
+    })
+    .expect("state should build");
+    build_router(state)
+}
+
 #[tokio::test]
 async fn health_endpoint_returns_ok() {
     let app = test_router();
@@ -490,6 +502,42 @@ async fn claude_messages_non_streaming_returns_claude_format() {
     let status = response.status();
     assert_ne!(status, StatusCode::UNAUTHORIZED);
     assert_ne!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn claude_messages_upstream_error_includes_reason_chain() {
+    let app = test_router_with_invalid_upstream();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-5.2","messages":[{"role":"user","content":"hello"}],"max_tokens":1024}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let body = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+
+    assert!(
+        message.contains("chain:"),
+        "error message should include causal chain: {message}"
+    );
+    assert!(
+        message.contains("root_cause:"),
+        "error message should include explicit root cause: {message}"
+    );
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,7 @@ use reqwest::header::SET_COOKIE;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::RwLock;
+use tracing::error;
 
 use crate::{
     config::Settings,
@@ -473,9 +475,11 @@ async fn auth_login_handler(
     let resp = match login_result {
         Ok(r) => r,
         Err(err) => {
+            let reason = format_std_error_chain(&err);
+            error!(endpoint = "/auth/login", error = %reason, "onyx login request failed");
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("failed to reach onyx: {err}")})),
+                Json(json!({"error": format!("failed to reach onyx: {reason}")})),
             )
                 .into_response();
         }
@@ -622,7 +626,15 @@ async fn v1_chat_completions_handler(
                     break;
                 }
                 Err(err) => {
-                    let err_msg = err.to_string();
+                    let err_msg = onyx_client::format_error_chain(&err);
+                    let cookie_fp = crate::cookie_manager::fingerprint(cookie);
+                    error!(
+                        endpoint = "/v1/chat/completions",
+                        mode = "stream",
+                        cookie = %cookie_fp,
+                        error = %err_msg,
+                        "upstream streaming_chat failed"
+                    );
                     let mut cm = state.cookie_manager.write().await;
                     cm.mark_call_failure(cookie, err_msg.clone());
                     cm.save();
@@ -796,7 +808,15 @@ async fn v1_chat_completions_handler(
                 return (StatusCode::OK, Json(json!(response))).into_response();
             }
             Err(err) => {
-                let err_msg = err.to_string();
+                let err_msg = onyx_client::format_error_chain(&err);
+                let cookie_fp = crate::cookie_manager::fingerprint(&cookie);
+                error!(
+                    endpoint = "/v1/chat/completions",
+                    mode = "non_stream",
+                    cookie = %cookie_fp,
+                    error = %err_msg,
+                    "upstream full_chat failed"
+                );
                 let mut cm = state.cookie_manager.write().await;
                 cm.mark_call_failure(&cookie, err_msg.clone());
                 cm.save();
@@ -872,13 +892,22 @@ async fn refresh_cookies_handler(
                 refreshed += 1;
             }
             Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                let reason = format!(
+                    "refresh failed: http {status}, body: {}",
+                    truncate_for_error(&body, 240)
+                );
+                error!(endpoint = "/api/cookies/refresh", error = %reason, "cookie refresh http failure");
                 entry.exhausted = true;
-                entry.last_error = Some(format!("http {}", resp.status().as_u16()));
+                entry.last_error = Some(reason);
                 failed += 1;
             }
             Err(err) => {
+                let reason = format_std_error_chain(&err);
+                error!(endpoint = "/api/cookies/refresh", error = %reason, "cookie refresh transport failure");
                 entry.exhausted = true;
-                entry.last_error = Some(err.to_string());
+                entry.last_error = Some(reason);
                 failed += 1;
             }
         }
@@ -989,7 +1018,15 @@ async fn v1_messages_handler(
                     break;
                 }
                 Err(err) => {
-                    let err_msg = err.to_string();
+                    let err_msg = onyx_client::format_error_chain(&err);
+                    let cookie_fp = crate::cookie_manager::fingerprint(cookie);
+                    error!(
+                        endpoint = "/v1/messages",
+                        mode = "stream",
+                        cookie = %cookie_fp,
+                        error = %err_msg,
+                        "claude streaming upstream failed"
+                    );
                     let mut cm = state.cookie_manager.write().await;
                     cm.mark_call_failure(cookie, err_msg.clone());
                     cm.save();
@@ -1158,7 +1195,15 @@ async fn v1_messages_handler(
                 return (StatusCode::OK, Json(json!(response))).into_response();
             }
             Err(err) => {
-                let err_msg = err.to_string();
+                let err_msg = onyx_client::format_error_chain(&err);
+                let cookie_fp = crate::cookie_manager::fingerprint(cookie);
+                error!(
+                    endpoint = "/v1/messages",
+                    mode = "non_stream",
+                    cookie = %cookie_fp,
+                    error = %err_msg,
+                    "claude non-stream upstream failed"
+                );
                 let mut cm = state.cookie_manager.write().await;
                 cm.mark_call_failure(cookie, err_msg.clone());
                 cm.save();
@@ -1211,6 +1256,37 @@ fn extract_cookie_from_headers(headers: &reqwest::header::HeaderMap) -> Option<S
         }
     }
     None
+}
+
+fn format_std_error_chain(err: &(dyn StdError + 'static)) -> String {
+    let mut chain = Vec::new();
+    chain.push(err.to_string());
+
+    let mut source = err.source();
+    while let Some(cause) = source {
+        chain.push(cause.to_string());
+        source = cause.source();
+    }
+
+    if chain.is_empty() {
+        return String::from("unknown error");
+    }
+
+    let root_cause = chain.last().cloned().unwrap_or_else(|| String::from("unknown error"));
+    format!(
+        "{} | chain: {} | root_cause: {}",
+        chain[0],
+        chain.join(" -> "),
+        root_cause
+    )
+}
+
+fn truncate_for_error(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let truncated = input.chars().take(max_chars).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn now_ts() -> u64 {

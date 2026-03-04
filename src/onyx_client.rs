@@ -85,6 +85,25 @@ pub enum StreamEvent {
     Done,
 }
 
+pub fn format_error_chain(err: &anyhow::Error) -> String {
+    let chain = err
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>();
+
+    if chain.is_empty() {
+        return String::from("unknown error");
+    }
+
+    let root_cause = err.root_cause().to_string();
+    format!(
+        "{} | chain: {} | root_cause: {}",
+        chain[0],
+        chain.join(" -> "),
+        root_cause
+    )
+}
+
 /// Like `full_chat`, but streams parsed events back via an mpsc channel.
 /// The caller receives `StreamEvent` items as they arrive from Onyx.
 pub async fn streaming_chat(
@@ -340,6 +359,8 @@ fn resolve_model(model_name: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
+
     use super::parse_onyx_stream_text;
 
     #[test]
@@ -364,5 +385,24 @@ data: [DONE]"#;
         let (content, thinking) = parse_onyx_stream_text(body);
         assert_eq!(content, "B");
         assert_eq!(thinking, "A");
+    }
+
+    #[test]
+    fn formats_full_error_chain_for_precise_debugging() {
+        let err = anyhow!("dns lookup failed").context("failed to call send-chat-message");
+        let rendered = super::format_error_chain(&err);
+
+        assert!(
+            rendered.contains("failed to call send-chat-message"),
+            "should include top-level context"
+        );
+        assert!(
+            rendered.contains("dns lookup failed"),
+            "should include root cause"
+        );
+        assert!(
+            rendered.contains("root_cause:"),
+            "should explicitly mark root cause"
+        );
     }
 }
