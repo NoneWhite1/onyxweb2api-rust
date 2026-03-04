@@ -45,6 +45,8 @@ impl ChatCompletionRequest {
                             non_empty_trimmed(function.name.as_str())
                         } else if let Some(name) = &tool.name {
                             non_empty_trimmed(name)
+                        } else if let Some(tool_type) = &tool.r#type {
+                            openai_tool_type_alias(tool_type)
                         } else {
                             None
                         }
@@ -63,6 +65,8 @@ impl ChatCompletionRequest {
                     non_empty_trimmed(function.name.as_str())
                 } else if let Some(name) = &obj.name {
                     non_empty_trimmed(name)
+                } else if let Some(tool_type) = &obj.r#type {
+                    openai_tool_type_alias(tool_type)
                 } else {
                     None
                 }
@@ -118,6 +122,17 @@ fn non_empty_trimmed(input: &str) -> Option<String> {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+fn openai_tool_type_alias(tool_type: &str) -> Option<String> {
+    let normalized = tool_type.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "code_interpreter" | "python" | "python_tool" => Some("python".to_string()),
+        "open_url" | "openurl" | "open_url_tool" | "openurltool" => {
+            Some("open_url".to_string())
+        }
+        _ => non_empty_trimmed(tool_type),
     }
 }
 
@@ -578,5 +593,21 @@ mod tests {
 
         assert_eq!(req.requested_tool_names(), vec!["shell"]);
         assert_eq!(req.forced_tool_name().as_deref(), Some("shell"));
+    }
+
+    #[test]
+    fn chat_completions_request_maps_code_interpreter_type_to_python() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "run code"}],
+            "tools": [
+                {"type": "code_interpreter"}
+            ],
+            "tool_choice": {"type": "code_interpreter"}
+        }))
+        .expect("should deserialize ChatCompletionRequest");
+
+        assert_eq!(req.requested_tool_names(), vec!["python"]);
+        assert_eq!(req.forced_tool_name().as_deref(), Some("python"));
     }
 }
