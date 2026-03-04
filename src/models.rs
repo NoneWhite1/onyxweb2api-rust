@@ -173,6 +173,22 @@ pub struct AssistantMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<AssistantToolCall>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssistantToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: AssistantToolCallFunction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssistantToolCallFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]

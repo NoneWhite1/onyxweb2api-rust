@@ -21,8 +21,9 @@ use crate::{
     config::Settings,
     cookie_manager::{CookieFailureKind, CookieManager},
     models::{
-        AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-        ChatMessage, Choice, ChunkChoice, ChunkDelta, ClaudeContentBlock,
+        AssistantMessage, AssistantToolCall, AssistantToolCallFunction, ChatCompletionChunk,
+        ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, ChunkChoice,
+        ChunkDelta, ClaudeContentBlock,
         ClaudeMessagesRequest, ClaudeMessagesResponse, ClaudeStreamContentBlockDelta,
         ClaudeStreamContentBlockStart, ClaudeStreamContentBlockStop,
         ClaudeStreamMessageDelta, ClaudeStreamMessageStart, ClaudeStreamMessageStop,
@@ -584,6 +585,41 @@ async fn v1_chat_completions_handler(
     let requested_tool_names = req.requested_tool_names();
     let forced_tool_name = req.forced_tool_name();
 
+    if !req.stream.unwrap_or(false)
+        && let Some((tool_name, command)) = maybe_build_local_bash_tool_call(&req)
+    {
+        let response = ChatCompletionResponse {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: "chat.completion",
+            created: now_ts(),
+            model: req.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            choices: vec![Choice {
+                index: 0,
+                message: AssistantMessage {
+                    role: "assistant",
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: Some(vec![AssistantToolCall {
+                        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                        kind: "function",
+                        function: AssistantToolCallFunction {
+                            name: tool_name,
+                            arguments: json!({"command": command}).to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: "tool_calls",
+            }],
+            usage: Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
+        };
+
+        return (StatusCode::OK, Json(json!(response))).into_response();
+    }
+
     if req.stream.unwrap_or(false) {
         let model = req.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let include_reasoning = req.include_reasoning.unwrap_or(true);
@@ -864,6 +900,7 @@ async fn v1_chat_completions_handler(
                             } else {
                                 None
                             },
+                            tool_calls: None,
                         },
                         finish_reason: "stop",
                     }],
@@ -1510,6 +1547,60 @@ fn truncate_for_error(input: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
+fn maybe_build_local_bash_tool_call(req: &ChatCompletionRequest) -> Option<(String, String)> {
+    let tool_names = req.requested_tool_names();
+    if !tool_names.iter().any(|name| name.eq_ignore_ascii_case("bash")) {
+        return None;
+    }
+
+    let user_message = req
+        .messages
+        .iter()
+        .rev()
+        .find(|msg| msg.role.eq_ignore_ascii_case("user"))
+        .map(|msg| msg.content.as_str())?;
+
+    let path = extract_file_path_from_text(user_message)?;
+    let content = extract_write_content_from_text(user_message)?;
+
+    let parent = std::path::Path::new(&path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| !p.is_empty())?;
+
+    let command = format!(
+        "mkdir -p \"{}\" && printf %s \"{}\" > \"{}\"",
+        escape_shell_double_quotes(&parent),
+        escape_shell_double_quotes(&content),
+        escape_shell_double_quotes(&path)
+    );
+
+    Some(("bash".to_string(), command))
+}
+
+fn extract_file_path_from_text(input: &str) -> Option<String> {
+    input
+        .split_whitespace()
+        .find(|token| token.starts_with('/') && token.contains('.') && !token.contains('"'))
+        .map(|token| token.trim_matches(|c| c == '，' || c == '。' || c == ',' || c == '.'))
+        .map(str::to_string)
+}
+
+fn extract_write_content_from_text(input: &str) -> Option<String> {
+    let marker = "写入";
+    let start = input.find(marker)? + marker.len();
+    let content = input[start..].trim();
+    if content.is_empty() {
+        None
+    } else {
+        Some(content.trim_matches('"').to_string())
+    }
+}
+
+fn escape_shell_double_quotes(input: &str) -> String {
+    input.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1519,8 +1610,9 @@ fn now_ts() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_cookie_failure;
+    use super::{classify_cookie_failure, maybe_build_local_bash_tool_call};
     use crate::cookie_manager::CookieFailureKind;
+    use crate::models::ChatCompletionRequest;
 
     #[test]
     fn classify_cookie_failure_marks_auth_error_as_permanent() {
@@ -1538,5 +1630,25 @@ mod tests {
     fn classify_cookie_failure_marks_transport_error_as_temporary() {
         let reason = "failed to call send-chat-message | chain: connection refused";
         assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Temporary);
+    }
+
+    #[test]
+    fn local_bash_tool_call_is_generated_for_create_and_write_request() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "帮我在 /home/nonewhite/Download/1234.txt 中写入 123"}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}
+            ],
+            "stream": false
+        }))
+        .expect("request should deserialize");
+
+        let (tool, cmd) = maybe_build_local_bash_tool_call(&req).expect("tool call expected");
+        assert_eq!(tool, "bash");
+        assert!(cmd.contains("/home/nonewhite/Download/1234.txt"));
+        assert!(cmd.contains("printf %s \"123\""));
     }
 }
