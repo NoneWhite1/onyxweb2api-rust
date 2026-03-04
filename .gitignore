@@ -1,0 +1,16 @@
+# Build artifacts
+/target/
+rust-proxy-release
+
+# Environment & secrets
+.env
+cookies.json
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
