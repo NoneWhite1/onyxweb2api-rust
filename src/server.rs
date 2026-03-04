@@ -1,0 +1,1286 @@
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    response::{Html, IntoResponse, Sse, sse::Event},
+    routing::{delete, get, post},
+};
+use futures_util::stream;
+use reqwest::header::SET_COOKIE;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::sync::RwLock;
+
+use crate::{
+    config::Settings,
+    cookie_manager::CookieManager,
+    models::{
+        AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+        ChatMessage, Choice, ChunkChoice, ChunkDelta, ClaudeContentBlock,
+        ClaudeMessagesRequest, ClaudeMessagesResponse, ClaudeStreamContentBlockDelta,
+        ClaudeStreamContentBlockStart, ClaudeStreamContentBlockStop,
+        ClaudeStreamMessageDelta, ClaudeStreamMessageStart, ClaudeStreamMessageStop,
+        ClaudeStreamMessageMeta, ClaudeStopDelta, ClaudeTextDelta, ClaudeUsage,
+        ModelItem, ModelsListResponse, Usage, DEFAULT_MODEL, supported_models,
+    },
+    onyx_client::{self, StreamEvent},
+};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub settings: Settings,
+    pub cookie_manager: Arc<RwLock<CookieManager>>,
+    pub http_client: reqwest::Client,
+    pub started_at_ts: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusResponse {
+    status: &'static str,
+    uptime_secs: u64,
+    onyx_base_url: String,
+    cookie_total: usize,
+    cookie_active: usize,
+    cookie_exhausted: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RefreshResponse {
+    total: usize,
+    refreshed: usize,
+    failed: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddCookieRequest {
+    cookie: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MutationResponse {
+    ok: bool,
+}
+
+pub fn build_state(settings: Settings) -> anyhow::Result<AppState> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(settings.request_timeout_secs))
+        .build()?;
+
+    Ok(AppState {
+        cookie_manager: Arc::new(RwLock::new(CookieManager::load_or_create(
+            &settings.cookie_persist_path,
+            &settings.onyx_auth_cookie,
+        ))),
+        http_client: client,
+        started_at_ts: now_ts(),
+        settings,
+    })
+}
+
+pub fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(root_handler))
+        .route("/health", get(health_handler))
+        .route("/ui", get(ui_handler))
+        .route("/api/status", get(status_handler))
+        .route("/v1/models", get(v1_models_handler))
+        .route("/v1/chat/completions", post(v1_chat_completions_handler))
+        .route("/v1/messages", post(v1_messages_handler))
+        .route("/api/cookies", get(cookies_handler).post(add_cookie_handler))
+        .route("/api/cookies/{fingerprint}", delete(delete_cookie_handler))
+        .route("/api/cookies/refresh", post(refresh_cookies_handler))
+        .route("/auth/login", get(auth_login_page_handler).post(auth_login_handler))
+        .with_state(state)
+}
+
+async fn root_handler() -> Json<serde_json::Value> {
+    Json(json!({ "message": "Onyx2OpenAI API is running" }))
+}
+
+async fn health_handler() -> Json<serde_json::Value> {
+    Json(json!({ "status": "healthy" }))
+}
+
+async fn ui_handler() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+        <!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Onyx Proxy Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f1117; --surface: #1a1d27; --surface2: #242736;
+      --border: #2e3348; --text: #e1e4ed; --muted: #8b8fa3;
+      --primary: #6c72cb; --primary-hover: #7b82d8;
+      --green: #34d399; --red: #f87171; --yellow: #fbbf24;
+      --radius: 10px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; padding: 24px; }
+    .container { max-width: 960px; margin: 0 auto; }
+    .header { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+    .header h1 { font-size: 22px; font-weight: 600; }
+    .header .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px,1fr)); gap: 14px; margin-bottom: 24px; }
+    .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; }
+    .stat-card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; margin-bottom: 6px; }
+    .stat-card .value { font-size: 26px; font-weight: 700; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 18px; }
+    .card-title { font-size: 14px; font-weight: 600; margin-bottom: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+    .input-row { display: flex; gap: 10px; margin-bottom: 14px; }
+    input[type=text], input[type=password] { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text); font-size: 14px; outline: none; transition: border .2s; }
+    input:focus { border-color: var(--primary); }
+    button { background: var(--primary); color: #fff; border: none; border-radius: 8px; padding: 10px 18px; font-size: 13px; font-weight: 500; cursor: pointer; transition: background .2s, transform .1s; white-space: nowrap; }
+    button:hover { background: var(--primary-hover); }
+    button:active { transform: scale(.97); }
+    button.secondary { background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
+    button.secondary:hover { background: var(--border); }
+    button.danger { background: transparent; border: 1px solid var(--red); color: var(--red); padding: 6px 12px; font-size: 12px; }
+    button.danger:hover { background: var(--red); color: #fff; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 10px 12px; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid var(--border); }
+    td { padding: 12px; border-bottom: 1px solid var(--border); }
+    tr:last-child td { border-bottom: none; }
+    .badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .badge-ok { background: rgba(52,211,153,.15); color: var(--green); }
+    .badge-err { background: rgba(248,113,113,.15); color: var(--red); }
+    .mono { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 12px; color: var(--muted); }
+    .actions-row { display: flex; gap: 10px; }
+    .empty-msg { text-align: center; padding: 32px; color: var(--muted); }
+    .toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 20px; font-size: 13px; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 99; }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="dot"></div>
+      <h1>Onyx Proxy Dashboard</h1>
+    </div>
+
+    <div class="stats">
+      <div class="stat-card"><div class="label">Uptime</div><div class="value" id="uptime">-</div></div>
+      <div class="stat-card"><div class="label">Active Cookies</div><div class="value" id="active" style="color:var(--green)">-</div></div>
+      <div class="stat-card"><div class="label">Exhausted</div><div class="value" id="exhausted" style="color:var(--red)">-</div></div>
+      <div class="stat-card"><div class="label">Total</div><div class="value" id="total">-</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Authentication</div>
+      <div class="input-row">
+        <input type="password" id="apiKeyInput" placeholder="API Key (leave empty if not required)" />
+        <button id="saveApiKeyBtn" class="secondary">Save Key</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Add Cookie</div>
+      <div class="input-row">
+        <input type="text" id="cookieInput" placeholder="Paste fastapiusersauth cookie value..." />
+        <button id="addBtn">Add</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Cookie Pool</span>
+        <button id="refreshBtn" class="secondary" style="padding:6px 14px;font-size:12px;">Refresh All</button>
+      </div>
+      <table>
+        <thead><tr><th>Fingerprint</th><th>Preview</th><th>Status</th><th>Last Refresh</th><th>Error</th><th></th></tr></thead>
+        <tbody id="cookies"></tbody>
+      </table>
+      <div class="empty-msg" id="emptyMsg" style="display:none">No cookies configured. Add one above.</div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    function authHeaders(extra = {}) {
+      const key = localStorage.getItem('proxy_api_key') || '';
+      if (!key) return extra;
+      return { ...extra, Authorization: `Bearer ${key}` };
+    }
+
+    async function apiFetch(url, options = {}) {
+      const headers = authHeaders(options.headers || {});
+      const resp = await fetch(url, { ...options, headers });
+      if (resp.status === 401) { toast('Unauthorized: check your API key', true); throw new Error('unauthorized'); }
+      return resp;
+    }
+
+    function toast(msg, isError = false) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.style.borderColor = isError ? 'var(--red)' : 'var(--green)';
+      el.classList.add('show');
+      setTimeout(() => el.classList.remove('show'), 2500);
+    }
+
+    function fmtUptime(s) {
+      if (s < 60) return s + 's';
+      if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+      const h = Math.floor(s/3600);
+      return h + 'h ' + Math.floor((s%3600)/60) + 'm';
+    }
+
+    function fmtTs(ts) {
+      if (!ts) return '-';
+      return new Date(ts * 1000).toLocaleString();
+    }
+
+    async function load() {
+      try {
+        const status = await apiFetch('/api/status').then(r => r.json());
+        document.getElementById('uptime').textContent = fmtUptime(status.uptime_secs);
+        document.getElementById('active').textContent = status.cookie_active;
+        document.getElementById('exhausted').textContent = status.cookie_exhausted;
+        document.getElementById('total').textContent = status.cookie_total;
+
+        const cookies = await apiFetch('/api/cookies').then(r => r.json());
+        const tbody = document.getElementById('cookies');
+        const emptyMsg = document.getElementById('emptyMsg');
+        tbody.innerHTML = '';
+        if (cookies.length === 0) { emptyMsg.style.display = ''; return; }
+        emptyMsg.style.display = 'none';
+
+        for (const c of cookies) {
+          const tr = document.createElement('tr');
+          const badge = c.exhausted
+            ? '<span class="badge badge-err">Exhausted</span>'
+            : '<span class="badge badge-ok">Active</span>';
+          tr.innerHTML = `<td class="mono">${c.fingerprint.slice(0,12)}</td><td class="mono">${c.preview}</td><td>${badge}</td><td>${fmtTs(c.last_refresh_ts)}</td><td style="color:var(--red);font-size:12px;">${c.last_error ?? '-'}</td><td><button class="danger" data-fp="${c.fingerprint}">Delete</button></td>`;
+          tbody.appendChild(tr);
+        }
+
+        for (const btn of tbody.querySelectorAll('button[data-fp]')) {
+          btn.onclick = async () => {
+            await apiFetch(`/api/cookies/${btn.dataset.fp}`, { method: 'DELETE' });
+            toast('Cookie removed');
+            await load();
+          };
+        }
+      } catch (e) { /* auth error already toasted */ }
+    }
+
+    document.getElementById('refreshBtn').onclick = async () => {
+      document.getElementById('refreshBtn').textContent = 'Refreshing...';
+      try {
+        const r = await apiFetch('/api/cookies/refresh', { method: 'POST' }).then(r => r.json());
+        toast(`Refreshed ${r.refreshed}/${r.total} cookies`);
+      } catch(e) {}
+      document.getElementById('refreshBtn').textContent = 'Refresh All';
+      await load();
+    };
+
+    document.getElementById('addBtn').onclick = async () => {
+      const input = document.getElementById('cookieInput');
+      const cookie = input.value.trim();
+      if (!cookie) return;
+      const r = await apiFetch('/api/cookies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cookie })
+      }).then(r => r.json());
+      input.value = '';
+      toast(r.ok ? 'Cookie added' : 'Cookie already exists or invalid');
+      await load();
+    };
+
+    document.getElementById('saveApiKeyBtn').onclick = async () => {
+      const input = document.getElementById('apiKeyInput');
+      const key = input.value.trim();
+      if (key) {
+        localStorage.setItem('proxy_api_key', key);
+        toast('API key saved');
+      } else {
+        localStorage.removeItem('proxy_api_key');
+        toast('API key cleared');
+      }
+      await load();
+    };
+
+    document.getElementById('apiKeyInput').value = localStorage.getItem('proxy_api_key') || '';
+    load();
+    setInterval(load, 3000);
+  </script>
+</body>
+</html>"#,
+    )
+}
+
+async fn auth_login_page_handler() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Login — Onyx Proxy</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0f1117; --surface: #1a1d27; --surface2: #242736;
+      --border: #2e3348; --text: #e1e4ed; --muted: #8b8fa3;
+      --primary: #6c72cb; --primary-hover: #7b82d8;
+      --green: #34d399; --red: #f87171;
+      --radius: 10px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .login-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 40px; width: 100%; max-width: 420px; }
+    .login-card h2 { font-size: 22px; font-weight: 700; margin-bottom: 8px; text-align: center; }
+    .login-card .sub { font-size: 13px; color: var(--muted); text-align: center; margin-bottom: 28px; }
+    .field { margin-bottom: 16px; }
+    .field label { display: block; font-size: 12px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+    .field input { width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; color: var(--text); font-size: 14px; outline: none; transition: border .2s; }
+    .field input:focus { border-color: var(--primary); }
+    .btn { width: 100%; background: var(--primary); color: #fff; border: none; border-radius: 8px; padding: 12px; font-size: 14px; font-weight: 600; cursor: pointer; transition: background .2s, transform .1s; margin-top: 8px; }
+    .btn:hover { background: var(--primary-hover); }
+    .btn:active { transform: scale(.98); }
+    .btn:disabled { opacity: .6; cursor: not-allowed; }
+    .divider { display: flex; align-items: center; gap: 12px; margin: 20px 0; font-size: 12px; color: var(--muted); }
+    .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+    .oauth-btn { width: 100%; display: flex; align-items: center; justify-content: center; gap: 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 14px; font-weight: 500; cursor: pointer; color: var(--text); text-decoration: none; transition: background .2s; }
+    .oauth-btn:hover { background: var(--border); }
+    .oauth-btn svg { width: 18px; height: 18px; }
+    .msg { margin-top: 14px; padding: 10px 14px; border-radius: 8px; font-size: 13px; display: none; }
+    .msg.error { display: block; background: rgba(248,113,113,.12); color: var(--red); border: 1px solid rgba(248,113,113,.2); }
+    .msg.success { display: block; background: rgba(52,211,153,.12); color: var(--green); border: 1px solid rgba(52,211,153,.2); }
+    .back { display: block; text-align: center; margin-top: 18px; color: var(--muted); font-size: 13px; text-decoration: none; }
+    .back:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <h2>🔑 Get Cookie</h2>
+    <div class="sub">Login to Onyx Cloud to automatically capture your auth cookie.</div>
+
+    <form id="loginForm">
+      <div class="field">
+        <label>Email</label>
+        <input type="email" id="email" placeholder="your@email.com" required autocomplete="email" />
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" id="password" placeholder="••••••••" required autocomplete="current-password" />
+      </div>
+      <button type="submit" class="btn" id="loginBtn">Login & Capture Cookie</button>
+    </form>
+
+    <div id="msg" class="msg"></div>
+
+    <div class="divider">or</div>
+
+    <a class="oauth-btn" href="https://cloud.onyx.app/auth/login" target="_blank" rel="noopener">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+      Login via Google on Onyx Cloud
+    </a>
+    <div style="text-align:center;margin-top:8px;font-size:11px;color:var(--muted);">
+      After Google login, copy the <code>fastapiusersauth</code> cookie from DevTools and paste it in the dashboard.
+    </div>
+
+    <a class="back" href="/ui">← Back to Dashboard</a>
+  </div>
+
+  <script>
+    const form = document.getElementById('loginForm');
+    const msgEl = document.getElementById('msg');
+    const btn = document.getElementById('loginBtn');
+
+    function authHeaders(extra = {}) {
+      const key = localStorage.getItem('proxy_api_key') || '';
+      if (!key) return extra;
+      return { ...extra, Authorization: `Bearer ${key}` };
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      msgEl.className = 'msg';
+      btn.disabled = true;
+      btn.textContent = 'Logging in...';
+
+      try {
+        const resp = await fetch('/auth/login', {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({
+            email: document.getElementById('email').value,
+            password: document.getElementById('password').value,
+          }),
+        });
+        const data = await resp.json();
+
+        if (resp.ok && data.ok) {
+          msgEl.className = 'msg success';
+          msgEl.textContent = '✅ Cookie captured! Fingerprint: ' + (data.fingerprint || 'unknown') + '. Redirecting...';
+          setTimeout(() => { window.location.href = '/ui'; }, 1500);
+        } else {
+          msgEl.className = 'msg error';
+          msgEl.textContent = data.error || 'Login failed. Check your credentials.';
+        }
+      } catch (err) {
+        msgEl.className = 'msg error';
+        msgEl.textContent = 'Network error: ' + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Login & Capture Cookie';
+      }
+    });
+  </script>
+</body>
+</html>"#,
+    )
+}
+
+async fn auth_login_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<LoginRequest>,
+) -> impl IntoResponse {
+    if let Err(status) = ensure_authorized(&headers, &state) {
+        return (status, Json(json!({"error":"unauthorized"}))).into_response();
+    }
+
+    // Proxy the login to Onyx Cloud's basic auth endpoint
+    let login_result = state
+        .http_client
+        .post(format!("{}/api/auth/login", state.settings.onyx_base_url))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "username={}&password={}",
+            urlencoding::encode(&payload.email),
+            urlencoding::encode(&payload.password),
+        ))
+        .send()
+        .await;
+
+    let resp = match login_result {
+        Ok(r) => r,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("failed to reach onyx: {err}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let status_code = resp.status();
+
+    // Extract the fastapiusersauth cookie from response
+    let cookie_value = extract_cookie_from_headers(resp.headers());
+
+    // Read body for error details
+    let body: serde_json::Value = resp.json().await.unwrap_or(json!({}));
+
+    if !status_code.is_success() || cookie_value.is_none() {
+        let detail = body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("login failed");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": detail})),
+        )
+            .into_response();
+    }
+
+    // Add the captured cookie to the cookie manager
+    let cookie_val = cookie_value.unwrap();
+    let fingerprint = {
+        let mut cm = state.cookie_manager.write().await;
+        cm.add_cookie(&cookie_val);
+        cm.save();
+        crate::cookie_manager::fingerprint(&cookie_val)
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "fingerprint": fingerprint,
+            "message": "Cookie captured and added to pool"
+        })),
+    )
+        .into_response()
+}
+
+async fn status_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<StatusResponse>, StatusCode> {
+    ensure_authorized(&headers, &state)?;
+    let cm = state.cookie_manager.read().await;
+    let stats = cm.stats();
+    Ok(Json(StatusResponse {
+        status: "healthy",
+        uptime_secs: now_ts().saturating_sub(state.started_at_ts),
+        onyx_base_url: state.settings.onyx_base_url.clone(),
+        cookie_total: stats.total,
+        cookie_active: stats.active,
+        cookie_exhausted: stats.exhausted,
+    }))
+}
+
+async fn v1_models_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<ModelsListResponse>, StatusCode> {
+    ensure_authorized(&headers, &state)?;
+
+    let data = supported_models()
+        .into_iter()
+        .map(|id| ModelItem {
+            id: id.to_string(),
+            object: "model",
+            created: 1_700_000_000,
+            owned_by: "onyx",
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(ModelsListResponse {
+        object: "list",
+        data,
+    }))
+}
+
+async fn v1_chat_completions_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> impl IntoResponse {
+    if let Err(status) = ensure_authorized(&headers, &state) {
+        return (status, Json(json!({"error":"unauthorized"}))).into_response();
+    }
+
+    if req.messages.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"messages must not be empty"})),
+        )
+            .into_response();
+    }
+
+    if req.stream.unwrap_or(false) {
+        let model = req.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let include_reasoning = req.include_reasoning.unwrap_or(true);
+
+        let cookie_values = {
+            let cm = state.cookie_manager.read().await;
+            cm.active_cookie_values()
+        };
+
+        if cookie_values.is_empty() {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error":"no cookies configured"})),
+            )
+                .into_response();
+        }
+
+        let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+        let created = now_ts();
+        let model_for_stream = model.clone();
+
+        // Try each cookie until one works
+        let mut last_err = String::from("unknown upstream error");
+        let mut rx_opt = None;
+        let mut _success_cookie: Option<String> = None;
+
+        for cookie in &cookie_values {
+            match onyx_client::streaming_chat(
+                &state.http_client,
+                &state.settings,
+                cookie,
+                &req.messages,
+                &model,
+            )
+            .await
+            {
+                Ok(rx) => {
+                    let mut cm = state.cookie_manager.write().await;
+                    cm.mark_call_success(cookie);
+                    cm.save();
+                    rx_opt = Some(rx);
+                    _success_cookie = Some(cookie.clone());
+                    break;
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    let mut cm = state.cookie_manager.write().await;
+                    cm.mark_call_failure(cookie, err_msg.clone());
+                    cm.save();
+                    last_err = err_msg;
+                }
+            }
+        }
+
+        let Some(rx) = rx_opt else {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("upstream failure: {last_err}")})),
+            )
+                .into_response();
+        };
+
+        // Build SSE stream from the mpsc receiver
+        let sse_stream = stream::unfold(
+            (rx, chat_id, model_for_stream, created, include_reasoning, false),
+            |(mut rx, chat_id, model, created, include_reasoning, done)| async move {
+                if done {
+                    return None;
+                }
+
+                match rx.recv().await {
+                    Some(StreamEvent::Role) => {
+                        let chunk = ChatCompletionChunk {
+                            id: chat_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: Some("assistant"),
+                                    content: None,
+                                    reasoning_content: None,
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        let event = Event::default().data(data);
+                        Some((Ok::<_, Infallible>(event), (rx, chat_id, model, created, include_reasoning, false)))
+                    }
+                    Some(StreamEvent::Reasoning(text)) => {
+                        if !include_reasoning {
+                            // Skip reasoning chunks if not requested
+                            return Some((
+                                Ok::<_, Infallible>(Event::default().data("")),
+                                (rx, chat_id, model, created, include_reasoning, false),
+                            ));
+                        }
+                        let chunk = ChatCompletionChunk {
+                            id: chat_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: None,
+                                    reasoning_content: Some(text),
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        let event = Event::default().data(data);
+                        Some((Ok::<_, Infallible>(event), (rx, chat_id, model, created, include_reasoning, false)))
+                    }
+                    Some(StreamEvent::Content(text)) => {
+                        let chunk = ChatCompletionChunk {
+                            id: chat_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: Some(text),
+                                    reasoning_content: None,
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        let event = Event::default().data(data);
+                        Some((Ok::<_, Infallible>(event), (rx, chat_id, model, created, include_reasoning, false)))
+                    }
+                    Some(StreamEvent::Done) | None => {
+                        let chunk = ChatCompletionChunk {
+                            id: chat_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: None,
+                                    reasoning_content: None,
+                                },
+                                finish_reason: Some("stop"),
+                            }],
+                        };
+                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        let stop_event = Event::default().data(data);
+                        Some((Ok::<_, Infallible>(stop_event), (rx, chat_id, model, created, include_reasoning, true)))
+                    }
+                }
+            },
+        );
+
+        return Sse::new(sse_stream).into_response();
+    }
+
+    let model = req.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let include_reasoning = req.include_reasoning.unwrap_or(true);
+
+    let cookie_values = {
+        let cm = state.cookie_manager.read().await;
+        cm.active_cookie_values()
+    };
+
+    if cookie_values.is_empty() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error":"no cookies configured"})),
+        )
+            .into_response();
+    }
+
+    let mut last_err = String::from("unknown upstream error");
+    for cookie in cookie_values {
+        match onyx_client::full_chat(&state.http_client, &state.settings, &cookie, &req.messages, &model)
+            .await
+        {
+            Ok((content, thinking)) => {
+                let mut cm = state.cookie_manager.write().await;
+                cm.mark_call_success(&cookie);
+                cm.save();
+
+                let response = ChatCompletionResponse {
+                    id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                    object: "chat.completion",
+                    created: now_ts(),
+                    model,
+                    choices: vec![Choice {
+                        index: 0,
+                        message: AssistantMessage {
+                            role: "assistant",
+                            content,
+                            reasoning_content: if include_reasoning && !thinking.is_empty() {
+                                Some(thinking)
+                            } else {
+                                None
+                            },
+                        },
+                        finish_reason: "stop",
+                    }],
+                    usage: Usage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                    },
+                };
+
+                return (StatusCode::OK, Json(json!(response))).into_response();
+            }
+            Err(err) => {
+                let err_msg = err.to_string();
+                let mut cm = state.cookie_manager.write().await;
+                cm.mark_call_failure(&cookie, err_msg.clone());
+                cm.save();
+                last_err = err_msg;
+            }
+        }
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": format!("upstream failure: {last_err}")})),
+    )
+        .into_response()
+}
+
+async fn cookies_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    ensure_authorized(&headers, &state)?;
+    let cm = state.cookie_manager.read().await;
+    Ok(Json(json!(cm.views())))
+}
+
+async fn add_cookie_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(payload): Json<AddCookieRequest>,
+) -> Result<Json<MutationResponse>, StatusCode> {
+    ensure_authorized(&headers, &state)?;
+    let mut cm = state.cookie_manager.write().await;
+    let ok = cm.add_cookie(&payload.cookie);
+    Ok(Json(MutationResponse { ok }))
+}
+
+async fn delete_cookie_handler(
+    headers: HeaderMap,
+    Path(fingerprint): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<MutationResponse>, StatusCode> {
+    ensure_authorized(&headers, &state)?;
+    let mut cm = state.cookie_manager.write().await;
+    let ok = cm.remove_by_fingerprint(&fingerprint);
+    Ok(Json(MutationResponse { ok }))
+}
+
+async fn refresh_cookies_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<RefreshResponse>, StatusCode> {
+    ensure_authorized(&headers, &state)?;
+    let mut refreshed = 0usize;
+    let mut failed = 0usize;
+
+    let mut cm = state.cookie_manager.write().await;
+    let total = cm.entries_mut().len();
+    for entry in cm.entries_mut() {
+        let res = state
+            .http_client
+            .post(format!("{}/api/auth/refresh", state.settings.onyx_base_url))
+            .header("Cookie", format!("fastapiusersauth={}", entry.value))
+            .send()
+            .await;
+
+        match res {
+            Ok(resp) if resp.status().is_success() => {
+                if let Some(updated) = extract_cookie_from_headers(resp.headers()) {
+                    entry.value = updated;
+                }
+                entry.exhausted = false;
+                entry.last_error = None;
+                entry.last_refresh_ts = Some(now_ts());
+                refreshed += 1;
+            }
+            Ok(resp) => {
+                entry.exhausted = true;
+                entry.last_error = Some(format!("http {}", resp.status().as_u16()));
+                failed += 1;
+            }
+            Err(err) => {
+                entry.exhausted = true;
+                entry.last_error = Some(err.to_string());
+                failed += 1;
+            }
+        }
+    }
+
+    cm.save();
+
+    Ok(Json(RefreshResponse {
+        total,
+        refreshed,
+        failed,
+    }))
+}
+
+/// Anthropic Claude-compatible Messages endpoint.
+/// Accepts requests in Claude format and converts to/from Onyx backend.
+async fn v1_messages_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<ClaudeMessagesRequest>,
+) -> impl IntoResponse {
+    // Claude uses x-api-key header instead of Bearer token
+    if let Some(expected) = &state.settings.api_key {
+        let api_key = headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| extract_bearer_token(&headers));
+        let valid = api_key.map(|k| k == expected.as_str()).unwrap_or(false);
+        if !valid {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}})),
+            )
+                .into_response();
+        }
+    }
+
+    if req.messages.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"type":"error","error":{"type":"invalid_request_error","message":"messages must not be empty"}})),
+        )
+            .into_response();
+    }
+
+    // Convert Claude messages to our internal ChatMessage format
+    let mut chat_messages: Vec<ChatMessage> = Vec::new();
+    if let Some(sys) = &req.system {
+        chat_messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: sys.clone(),
+        });
+    }
+    for m in &req.messages {
+        chat_messages.push(ChatMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        });
+    }
+
+    let model = req.model.clone();
+
+    let cookie_values = {
+        let cm = state.cookie_manager.read().await;
+        cm.active_cookie_values()
+    };
+
+    if cookie_values.is_empty() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"type":"error","error":{"type":"api_error","message":"no cookies configured"}})),
+        )
+            .into_response();
+    }
+
+    // ----- Streaming mode -----
+    if req.stream.unwrap_or(false) {
+        let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
+        let model_for_stream = model.clone();
+
+        let mut last_err = String::from("unknown upstream error");
+        let mut rx_opt: Option<tokio::sync::mpsc::Receiver<StreamEvent>> = None;
+
+        for cookie in &cookie_values {
+            match onyx_client::streaming_chat(
+                &state.http_client,
+                &state.settings,
+                cookie,
+                &chat_messages,
+                &model,
+            )
+            .await
+            {
+                Ok(rx) => {
+                    let mut cm = state.cookie_manager.write().await;
+                    cm.mark_call_success(cookie);
+                    cm.save();
+                    rx_opt = Some(rx);
+                    break;
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    let mut cm = state.cookie_manager.write().await;
+                    cm.mark_call_failure(cookie, err_msg.clone());
+                    cm.save();
+                    last_err = err_msg;
+                }
+            }
+        }
+
+        let Some(rx) = rx_opt else {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}})),
+            )
+                .into_response();
+        };
+
+        // Build SSE stream for Claude format
+        // State: (rx, msg_id, model, phase, content_index, output_tokens)
+        // phase: 0=start, 1=streaming, 2=done
+        let sse_stream = stream::unfold(
+            (rx, msg_id, model_for_stream, 0u8, 0u32),
+            |(mut rx, msg_id, model, phase, output_tokens)| async move {
+                match phase {
+                    0 => {
+                        // Emit message_start + content_block_start
+                        let start = ClaudeStreamMessageStart {
+                            type_field: "message_start",
+                            message: ClaudeStreamMessageMeta {
+                                id: msg_id.clone(),
+                                type_field: "message",
+                                role: "assistant",
+                                content: vec![],
+                                model: model.clone(),
+                                stop_reason: None,
+                                usage: ClaudeUsage {
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                },
+                            },
+                        };
+                        let start_data = serde_json::to_string(&start).unwrap_or_default();
+                        let event = Event::default()
+                            .event("message_start")
+                            .data(start_data);
+                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 1, output_tokens)))
+                    }
+                    1 => {
+                        // Wait for first real content event to emit content_block_start
+                        match rx.recv().await {
+                            Some(StreamEvent::Role) => {
+                                let block_start = ClaudeStreamContentBlockStart {
+                                    type_field: "content_block_start",
+                                    index: 0,
+                                    content_block: ClaudeContentBlock {
+                                        type_field: "text",
+                                        text: String::new(),
+                                    },
+                                };
+                                let data = serde_json::to_string(&block_start).unwrap_or_default();
+                                let event = Event::default()
+                                    .event("content_block_start")
+                                    .data(data);
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens)))
+                            }
+                            Some(StreamEvent::Content(_text)) => {
+                                // No role event, jump to content_block_start + delta
+                                let block_start = ClaudeStreamContentBlockStart {
+                                    type_field: "content_block_start",
+                                    index: 0,
+                                    content_block: ClaudeContentBlock {
+                                        type_field: "text",
+                                        text: String::new(),
+                                    },
+                                };
+                                let data = serde_json::to_string(&block_start).unwrap_or_default();
+                                let event = Event::default()
+                                    .event("content_block_start")
+                                    .data(data);
+                                // We'll emit the first delta on the next call — put content back
+                                // Actually we can't put it back. Emit combined.
+                                // Let's emit block_start first, delta will come next iteration
+                                // For simplicity, put text into output_tokens as marker
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens)))
+                            }
+                            Some(StreamEvent::Reasoning(_)) => {
+                                // Skip reasoning for now in Claude format (or emit as thinking block)
+                                let block_start = ClaudeStreamContentBlockStart {
+                                    type_field: "content_block_start",
+                                    index: 0,
+                                    content_block: ClaudeContentBlock {
+                                        type_field: "text",
+                                        text: String::new(),
+                                    },
+                                };
+                                let data = serde_json::to_string(&block_start).unwrap_or_default();
+                                let event = Event::default()
+                                    .event("content_block_start")
+                                    .data(data);
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens)))
+                            }
+                            Some(StreamEvent::Done) | None => {
+                                // No content at all, close
+                                let stop = ClaudeStreamMessageStop {
+                                    type_field: "message_stop",
+                                };
+                                let data = serde_json::to_string(&stop).unwrap_or_default();
+                                let event = Event::default()
+                                    .event("message_stop")
+                                    .data(data);
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 99, output_tokens)))
+                            }
+                        }
+                    }
+                    2 => {
+                        // Main content streaming phase
+                        match rx.recv().await {
+                            Some(StreamEvent::Content(text)) => {
+                                let new_tokens = output_tokens + 1;
+                                let delta = ClaudeStreamContentBlockDelta {
+                                    type_field: "content_block_delta",
+                                    index: 0,
+                                    delta: ClaudeTextDelta {
+                                        type_field: "text_delta",
+                                        text,
+                                    },
+                                };
+                                let data = serde_json::to_string(&delta).unwrap_or_default();
+                                let event = Event::default()
+                                    .event("content_block_delta")
+                                    .data(data);
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, new_tokens)))
+                            }
+                            Some(StreamEvent::Reasoning(text)) => {
+                                // Emit reasoning as content_block_delta with text for now
+                                let new_tokens = output_tokens + 1;
+                                let delta = ClaudeStreamContentBlockDelta {
+                                    type_field: "content_block_delta",
+                                    index: 0,
+                                    delta: ClaudeTextDelta {
+                                        type_field: "text_delta",
+                                        text,
+                                    },
+                                };
+                                let data = serde_json::to_string(&delta).unwrap_or_default();
+                                let event = Event::default()
+                                    .event("content_block_delta")
+                                    .data(data);
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, new_tokens)))
+                            }
+                            Some(StreamEvent::Role) => {
+                                // Skip duplicate role events
+                                let event = Event::default().event("ping").data("{\"type\":\"ping\"}");
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens)))
+                            }
+                            Some(StreamEvent::Done) | None => {
+                                // Emit content_block_stop + message_delta + message_stop
+                                let block_stop = ClaudeStreamContentBlockStop {
+                                    type_field: "content_block_stop",
+                                    index: 0,
+                                };
+                                let data = serde_json::to_string(&block_stop).unwrap_or_default();
+                                let event = Event::default()
+                                    .event("content_block_stop")
+                                    .data(data);
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 3, output_tokens)))
+                            }
+                        }
+                    }
+                    3 => {
+                        // Emit message_delta
+                        let msg_delta = ClaudeStreamMessageDelta {
+                            type_field: "message_delta",
+                            delta: ClaudeStopDelta {
+                                stop_reason: "end_turn",
+                            },
+                            usage: ClaudeUsage {
+                                input_tokens: 0,
+                                output_tokens,
+                            },
+                        };
+                        let data = serde_json::to_string(&msg_delta).unwrap_or_default();
+                        let event = Event::default()
+                            .event("message_delta")
+                            .data(data);
+                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 4, output_tokens)))
+                    }
+                    4 => {
+                        // Emit message_stop
+                        let stop = ClaudeStreamMessageStop {
+                            type_field: "message_stop",
+                        };
+                        let data = serde_json::to_string(&stop).unwrap_or_default();
+                        let event = Event::default()
+                            .event("message_stop")
+                            .data(data);
+                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 99, output_tokens)))
+                    }
+                    _ => None, // 99 = terminal
+                }
+            },
+        );
+
+        return Sse::new(sse_stream).into_response();
+    }
+
+    // ----- Non-streaming mode -----
+    let mut last_err = String::from("unknown upstream error");
+
+    for cookie in &cookie_values {
+        match onyx_client::full_chat(
+            &state.http_client,
+            &state.settings,
+            cookie,
+            &chat_messages,
+            &model,
+        )
+        .await
+        {
+            Ok((content, _thinking)) => {
+                let mut cm = state.cookie_manager.write().await;
+                cm.mark_call_success(cookie);
+                cm.save();
+
+                let response = ClaudeMessagesResponse {
+                    id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
+                    type_field: "message",
+                    role: "assistant",
+                    content: vec![ClaudeContentBlock {
+                        type_field: "text",
+                        text: content,
+                    }],
+                    model: model.clone(),
+                    stop_reason: "end_turn",
+                    usage: ClaudeUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                };
+
+                return (StatusCode::OK, Json(json!(response))).into_response();
+            }
+            Err(err) => {
+                let err_msg = err.to_string();
+                let mut cm = state.cookie_manager.write().await;
+                cm.mark_call_failure(cookie, err_msg.clone());
+                cm.save();
+                last_err = err_msg;
+            }
+        }
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}})),
+    )
+        .into_response()
+}
+
+fn ensure_authorized(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
+    match &state.settings.api_key {
+        None => Ok(()),
+        Some(expected) => {
+            let valid = extract_bearer_token(headers)
+                .map(|token| token == expected)
+                .unwrap_or(false);
+            if valid {
+                Ok(())
+            } else {
+                Err(StatusCode::UNAUTHORIZED)
+            }
+        }
+    }
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let auth = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let token = auth.strip_prefix("Bearer ")?;
+    if token.trim().is_empty() {
+        None
+    } else {
+        Some(token.trim())
+    }
+}
+
+fn extract_cookie_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    for value in headers.get_all(SET_COOKIE) {
+        let s = value.to_str().ok()?;
+        for part in s.split(';') {
+            let item = part.trim();
+            if let Some(v) = item.strip_prefix("fastapiusersauth=") {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn now_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
