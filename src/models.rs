@@ -166,7 +166,8 @@ where
     match v {
         Value::String(s) => Ok(s),
         Value::Array(arr) => Ok(extract_text_from_blocks(&arr)),
-        _ => Err(de::Error::custom("content must be string or array")),
+        Value::Object(obj) => Ok(extract_text_from_blocks(&[Value::Object(obj)])),
+        _ => Err(de::Error::custom("content must be string, object, or array")),
     }
 }
 
@@ -192,6 +193,15 @@ fn extract_text_from_blocks(arr: &[serde_json::Value]) -> String {
                     let nested_text = extract_text_from_blocks(nested);
                     if !nested_text.is_empty() {
                         parts.push(nested_text);
+                    }
+                }
+                Value::Object(obj) => {
+                    if let Some(text) = obj.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        parts.push(text.to_string());
+                    } else {
+                        parts.push(content.to_string());
                     }
                 }
                 _ => {}

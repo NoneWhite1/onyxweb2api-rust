@@ -581,6 +581,70 @@ async fn claude_messages_tools_payload_with_system_blocks_does_not_422() {
 }
 
 #[tokio::test]
+async fn claude_messages_content_object_shape_does_not_422() {
+    let app = test_router_with_invalid_upstream();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"claude-opus-4.6",
+                        "messages":[
+                          {
+                            "role":"user",
+                            "content":{"type":"text","text":"hello from object content"}
+                          }
+                        ],
+                        "max_tokens":1024
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn claude_messages_tool_result_object_content_does_not_422() {
+    let app = test_router_with_invalid_upstream();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"claude-opus-4.6",
+                        "messages":[
+                          {
+                            "role":"assistant",
+                            "content":[{"type":"tool_use","id":"toolu_1","name":"shell","input":{"cmd":"pwd"}}]
+                          },
+                          {
+                            "role":"user",
+                            "content":[{"type":"tool_result","tool_use_id":"toolu_1","content":{"text":"/home/nonewhite"}}]
+                          }
+                        ],
+                        "max_tokens":1024
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
 async fn claude_messages_invalid_json_returns_reason_text() {
     let app = test_router();
 
