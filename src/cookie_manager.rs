@@ -8,8 +8,18 @@ pub struct CookieEntry {
     pub fingerprint: String,
     #[serde(default)]
     pub exhausted: bool,
+    #[serde(default)]
+    pub temporary_failures: u32,
     pub last_refresh_ts: Option<u64>,
+    #[serde(default)]
+    pub cooldown_until_ts: Option<u64>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookieFailureKind {
+    Temporary,
+    Permanent,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,8 +59,7 @@ impl CookieManager {
         let mut manager = if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(data) => {
-                    let cookies: Vec<CookieEntry> =
-                        serde_json::from_str(&data).unwrap_or_default();
+                    let cookies: Vec<CookieEntry> = serde_json::from_str(&data).unwrap_or_default();
                     Self {
                         cookies,
                         persist_path: Some(path.clone()),
@@ -76,8 +85,7 @@ impl CookieManager {
             if trimmed.is_empty() {
                 continue;
             }
-            let value = extract_fastapiusersauth(trimmed)
-                .unwrap_or_else(|| trimmed.to_string());
+            let value = extract_fastapiusersauth(trimmed).unwrap_or_else(|| trimmed.to_string());
             if value.is_empty() || existing_values.contains(&value) {
                 continue;
             }
@@ -85,7 +93,9 @@ impl CookieManager {
                 fingerprint: fingerprint(&value),
                 value,
                 exhausted: false,
+                temporary_failures: 0,
                 last_refresh_ts: None,
+                cooldown_until_ts: None,
                 last_error: None,
             });
         }
@@ -103,8 +113,7 @@ impl CookieManager {
             if trimmed.is_empty() {
                 continue;
             }
-            let value = extract_fastapiusersauth(trimmed)
-                .unwrap_or_else(|| trimmed.to_string());
+            let value = extract_fastapiusersauth(trimmed).unwrap_or_else(|| trimmed.to_string());
             if value.is_empty() || seen.contains(&value) {
                 continue;
             }
@@ -113,7 +122,9 @@ impl CookieManager {
                 fingerprint: fingerprint(&value),
                 value,
                 exhausted: false,
+                temporary_failures: 0,
                 last_refresh_ts: None,
+                cooldown_until_ts: None,
                 last_error: None,
             });
         }
@@ -126,10 +137,20 @@ impl CookieManager {
 
     pub fn stats(&self) -> CookieStats {
         let exhausted = self.cookies.iter().filter(|c| c.exhausted).count();
+        let now = now_ts();
+        let cooling_down = self
+            .cookies
+            .iter()
+            .filter(|c| !c.exhausted && c.cooldown_until_ts.is_some_and(|until| until > now))
+            .count();
         CookieStats {
             total: self.cookies.len(),
             exhausted,
-            active: self.cookies.len().saturating_sub(exhausted),
+            active: self
+                .cookies
+                .len()
+                .saturating_sub(exhausted)
+                .saturating_sub(cooling_down),
         }
     }
 
@@ -151,10 +172,12 @@ impl CookieManager {
     }
 
     pub fn active_cookie_values(&self) -> Vec<String> {
+        let now = now_ts();
         let mut active: Vec<String> = self
             .cookies
             .iter()
             .filter(|c| !c.exhausted)
+            .filter(|c| c.cooldown_until_ts.is_none_or(|until| until <= now))
             .map(|c| c.value.clone())
             .collect();
         if active.is_empty() {
@@ -166,13 +189,37 @@ impl CookieManager {
     pub fn mark_call_success(&mut self, cookie_value: &str) {
         if let Some(entry) = self.cookies.iter_mut().find(|c| c.value == cookie_value) {
             entry.exhausted = false;
+            entry.temporary_failures = 0;
+            entry.cooldown_until_ts = None;
             entry.last_error = None;
         }
     }
 
-    pub fn mark_call_failure(&mut self, cookie_value: &str, error: String) {
+    pub fn mark_call_failure(
+        &mut self,
+        cookie_value: &str,
+        kind: CookieFailureKind,
+        error: String,
+    ) {
+        const TEMP_FAILURE_THRESHOLD: u32 = 3;
+        const TEMP_FAILURE_COOLDOWN_SECS: u64 = 120;
+
         if let Some(entry) = self.cookies.iter_mut().find(|c| c.value == cookie_value) {
-            entry.exhausted = true;
+            match kind {
+                CookieFailureKind::Permanent => {
+                    entry.exhausted = true;
+                    entry.temporary_failures = 0;
+                    entry.cooldown_until_ts = None;
+                }
+                CookieFailureKind::Temporary => {
+                    entry.temporary_failures = entry.temporary_failures.saturating_add(1);
+                    if entry.temporary_failures >= TEMP_FAILURE_THRESHOLD {
+                        entry.cooldown_until_ts =
+                            Some(now_ts().saturating_add(TEMP_FAILURE_COOLDOWN_SECS));
+                        entry.temporary_failures = 0;
+                    }
+                }
+            }
             entry.last_error = Some(error);
         }
     }
@@ -187,7 +234,9 @@ impl CookieManager {
             fingerprint: fingerprint(&value),
             value,
             exhausted: false,
+            temporary_failures: 0,
             last_refresh_ts: None,
+            cooldown_until_ts: None,
             last_error: None,
         });
         self.save();
@@ -243,4 +292,57 @@ pub fn fingerprint(value: &str) -> String {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn now_ts() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CookieEntry, CookieFailureKind, CookieManager};
+
+    fn manager_with_cookie(value: &str) -> CookieManager {
+        CookieManager {
+            cookies: vec![CookieEntry {
+                value: value.to_string(),
+                fingerprint: super::fingerprint(value),
+                exhausted: false,
+                temporary_failures: 0,
+                last_refresh_ts: None,
+                cooldown_until_ts: None,
+                last_error: None,
+            }],
+            persist_path: None,
+        }
+    }
+
+    #[test]
+    fn temporary_failure_does_not_exhaust_cookie() {
+        let mut manager = manager_with_cookie("cookie-A");
+        manager.mark_call_failure(
+            "cookie-A",
+            CookieFailureKind::Temporary,
+            "upstream 500".to_string(),
+        );
+
+        assert!(!manager.entries_mut()[0].exhausted);
+        assert_eq!(manager.entries_mut()[0].temporary_failures, 1);
+    }
+
+    #[test]
+    fn permanent_failure_exhausts_cookie_immediately() {
+        let mut manager = manager_with_cookie("cookie-A");
+        manager.mark_call_failure(
+            "cookie-A",
+            CookieFailureKind::Permanent,
+            "onyx auth failed: 401".to_string(),
+        );
+
+        assert!(manager.entries_mut()[0].exhausted);
+    }
 }

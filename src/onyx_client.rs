@@ -70,35 +70,22 @@ pub fn resolve_tool_selection_by_name(
             let Some(name) = candidate else {
                 continue;
             };
-            let normalized = normalize_tool_name(name);
-            if normalized.is_empty() {
-                continue;
+            for alias in tool_name_aliases(name) {
+                lookup.entry(alias).or_insert(tool.id);
             }
-            lookup.entry(normalized).or_insert(tool.id);
         }
     }
 
     let mut allowed_ids = Vec::new();
     for name in requested_tool_names {
-        let normalized = normalize_tool_name(name);
-        if normalized.is_empty() {
-            continue;
-        }
-        if let Some(id) = lookup.get(&normalized)
-            && !allowed_ids.contains(id)
+        if let Some(id) = resolve_lookup_id(&lookup, name)
+            && !allowed_ids.contains(&id)
         {
-            allowed_ids.push(*id);
+            allowed_ids.push(id);
         }
     }
 
-    let forced_tool_id = forced_tool_name.and_then(|name| {
-        let normalized = normalize_tool_name(name);
-        if normalized.is_empty() {
-            None
-        } else {
-            lookup.get(&normalized).copied()
-        }
-    });
+    let forced_tool_id = forced_tool_name.and_then(|name| resolve_lookup_id(&lookup, name));
 
     if let Some(forced_id) = forced_tool_id
         && !allowed_ids.contains(&forced_id)
@@ -425,6 +412,28 @@ fn normalize_tool_name(input: &str) -> String {
         .collect()
 }
 
+fn tool_name_aliases(input: &str) -> Vec<String> {
+    let normalized = normalize_tool_name(input);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut aliases = vec![normalized.clone()];
+    if normalized.ends_with("tool") && normalized.len() > 4 {
+        aliases.push(normalized[..normalized.len() - 4].to_string());
+    }
+    aliases
+}
+
+fn resolve_lookup_id(lookup: &HashMap<String, i64>, input: &str) -> Option<i64> {
+    for alias in tool_name_aliases(input) {
+        if let Some(id) = lookup.get(&alias) {
+            return Some(*id);
+        }
+    }
+    None
+}
+
 async fn create_chat_session(
     client: &reqwest::Client,
     settings: &Settings,
@@ -603,6 +612,39 @@ data: [DONE]"#;
 
         assert_eq!(allowed, Some(vec![11, 22]));
         assert_eq!(forced, Some(11));
+    }
+
+    #[test]
+    fn resolve_tool_selection_maps_python_alias_to_python_tool() {
+        let tools = vec![super::OnyxToolMetadata {
+            id: 22,
+            name: Some("PythonTool".to_string()),
+            display_name: Some("Code Interpreter".to_string()),
+            in_code_tool_id: Some("PythonTool".to_string()),
+        }];
+
+        let requested = vec!["python".to_string()];
+        let (allowed, forced) = super::resolve_tool_selection_by_name(&tools, &requested, Some("python"));
+
+        assert_eq!(allowed, Some(vec![22]));
+        assert_eq!(forced, Some(22));
+    }
+
+    #[test]
+    fn resolve_tool_selection_maps_open_url_alias_to_open_url_tool() {
+        let tools = vec![super::OnyxToolMetadata {
+            id: 33,
+            name: Some("OpenURLTool".to_string()),
+            display_name: Some("Open URL".to_string()),
+            in_code_tool_id: Some("OpenURLTool".to_string()),
+        }];
+
+        let requested = vec!["open_url".to_string()];
+        let (allowed, forced) =
+            super::resolve_tool_selection_by_name(&tools, &requested, Some("open_url"));
+
+        assert_eq!(allowed, Some(vec![33]));
+        assert_eq!(forced, Some(33));
     }
 
     #[test]

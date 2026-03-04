@@ -19,7 +19,7 @@ use tracing::error;
 
 use crate::{
     config::Settings,
-    cookie_manager::CookieManager,
+    cookie_manager::{CookieFailureKind, CookieManager},
     models::{
         AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
         ChatMessage, Choice, ChunkChoice, ChunkDelta, ClaudeContentBlock,
@@ -633,7 +633,7 @@ async fn v1_chat_completions_handler(
                             "tool translation failed"
                         );
                         let mut cm = state.cookie_manager.write().await;
-                        cm.mark_call_failure(cookie, err_msg.clone());
+                        mark_cookie_failure(&mut cm, cookie, err_msg.clone());
                         cm.save();
                         last_err = err_msg;
                         continue;
@@ -670,7 +670,7 @@ async fn v1_chat_completions_handler(
                         "upstream streaming_chat failed"
                     );
                     let mut cm = state.cookie_manager.write().await;
-                    cm.mark_call_failure(cookie, err_msg.clone());
+                    mark_cookie_failure(&mut cm, cookie, err_msg.clone());
                     cm.save();
                     last_err = err_msg;
                 }
@@ -827,7 +827,7 @@ async fn v1_chat_completions_handler(
                     "tool translation failed"
                 );
                 let mut cm = state.cookie_manager.write().await;
-                cm.mark_call_failure(&cookie, err_msg.clone());
+                mark_cookie_failure(&mut cm, &cookie, err_msg.clone());
                 cm.save();
                 last_err = err_msg;
                 continue;
@@ -887,7 +887,7 @@ async fn v1_chat_completions_handler(
                     "upstream full_chat failed"
                 );
                 let mut cm = state.cookie_manager.write().await;
-                cm.mark_call_failure(&cookie, err_msg.clone());
+                mark_cookie_failure(&mut cm, &cookie, err_msg.clone());
                 cm.save();
                 last_err = err_msg;
             }
@@ -956,6 +956,8 @@ async fn refresh_cookies_handler(
                     entry.value = updated;
                 }
                 entry.exhausted = false;
+                entry.temporary_failures = 0;
+                entry.cooldown_until_ts = None;
                 entry.last_error = None;
                 entry.last_refresh_ts = Some(now_ts());
                 refreshed += 1;
@@ -968,14 +970,36 @@ async fn refresh_cookies_handler(
                     truncate_for_error(&body, 240)
                 );
                 error!(endpoint = "/api/cookies/refresh", error = %reason, "cookie refresh http failure");
-                entry.exhausted = true;
+                let kind = classify_cookie_failure(&reason);
+                if matches!(kind, CookieFailureKind::Permanent) {
+                    entry.exhausted = true;
+                    entry.temporary_failures = 0;
+                    entry.cooldown_until_ts = None;
+                } else {
+                    entry.temporary_failures = entry.temporary_failures.saturating_add(1);
+                    if entry.temporary_failures >= 3 {
+                        entry.cooldown_until_ts = Some(now_ts().saturating_add(120));
+                        entry.temporary_failures = 0;
+                    }
+                }
                 entry.last_error = Some(reason);
                 failed += 1;
             }
             Err(err) => {
                 let reason = format_std_error_chain(&err);
                 error!(endpoint = "/api/cookies/refresh", error = %reason, "cookie refresh transport failure");
-                entry.exhausted = true;
+                let kind = classify_cookie_failure(&reason);
+                if matches!(kind, CookieFailureKind::Permanent) {
+                    entry.exhausted = true;
+                    entry.temporary_failures = 0;
+                    entry.cooldown_until_ts = None;
+                } else {
+                    entry.temporary_failures = entry.temporary_failures.saturating_add(1);
+                    if entry.temporary_failures >= 3 {
+                        entry.cooldown_until_ts = Some(now_ts().saturating_add(120));
+                        entry.temporary_failures = 0;
+                    }
+                }
                 entry.last_error = Some(reason);
                 failed += 1;
             }
@@ -1111,7 +1135,7 @@ async fn v1_messages_handler(
                             "tool translation failed"
                         );
                         let mut cm = state.cookie_manager.write().await;
-                        cm.mark_call_failure(cookie, err_msg.clone());
+                        mark_cookie_failure(&mut cm, cookie, err_msg.clone());
                         cm.save();
                         last_err = err_msg;
                         continue;
@@ -1147,7 +1171,7 @@ async fn v1_messages_handler(
                         "claude streaming upstream failed"
                     );
                     let mut cm = state.cookie_manager.write().await;
-                    cm.mark_call_failure(cookie, err_msg.clone());
+                    mark_cookie_failure(&mut cm, cookie, err_msg.clone());
                     cm.save();
                     last_err = err_msg;
                 }
@@ -1302,7 +1326,7 @@ async fn v1_messages_handler(
                     "tool translation failed"
                 );
                 let mut cm = state.cookie_manager.write().await;
-                cm.mark_call_failure(cookie, err_msg.clone());
+                mark_cookie_failure(&mut cm, cookie, err_msg.clone());
                 cm.save();
                 last_err = err_msg;
                 continue;
@@ -1354,7 +1378,7 @@ async fn v1_messages_handler(
                     "claude non-stream upstream failed"
                 );
                 let mut cm = state.cookie_manager.write().await;
-                cm.mark_call_failure(cookie, err_msg.clone());
+                mark_cookie_failure(&mut cm, cookie, err_msg.clone());
                 cm.save();
                 last_err = err_msg;
             }
@@ -1400,6 +1424,35 @@ fn ensure_authorized(headers: &HeaderMap, state: &AppState) -> Result<(), Status
                 Err(StatusCode::UNAUTHORIZED)
             }
         }
+    }
+}
+
+fn mark_cookie_failure(cm: &mut CookieManager, cookie: &str, reason: String) {
+    let kind = classify_cookie_failure(&reason);
+    cm.mark_call_failure(cookie, kind, reason);
+}
+
+fn classify_cookie_failure(reason: &str) -> CookieFailureKind {
+    let lower = reason.to_ascii_lowercase();
+
+    let permanent_markers = [
+        "onyx auth failed: 401",
+        "onyx auth failed: 403",
+        "http 401",
+        "http 403",
+        "http 429",
+        "rate limit",
+        "insufficient_quota",
+        "quota exceeded",
+        "quota exhausted",
+        "credit balance",
+        "额度耗尽",
+    ];
+
+    if permanent_markers.iter().any(|marker| lower.contains(marker)) {
+        CookieFailureKind::Permanent
+    } else {
+        CookieFailureKind::Temporary
     }
 }
 
@@ -1462,4 +1515,28 @@ fn now_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_cookie_failure;
+    use crate::cookie_manager::CookieFailureKind;
+
+    #[test]
+    fn classify_cookie_failure_marks_auth_error_as_permanent() {
+        let reason = "onyx auth failed: 401 | chain: ...";
+        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Permanent);
+    }
+
+    #[test]
+    fn classify_cookie_failure_marks_rate_limit_as_permanent() {
+        let reason = "onyx send-chat-message HTTP 429: rate limit exceeded";
+        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Permanent);
+    }
+
+    #[test]
+    fn classify_cookie_failure_marks_transport_error_as_temporary() {
+        let reason = "failed to call send-chat-message | chain: connection refused";
+        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Temporary);
+    }
 }
