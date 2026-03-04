@@ -581,6 +581,9 @@ async fn v1_chat_completions_handler(
             .into_response();
     }
 
+    let requested_tool_names = req.requested_tool_names();
+    let forced_tool_name = req.forced_tool_name();
+
     if req.stream.unwrap_or(false) {
         let model = req.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let include_reasoning = req.include_reasoning.unwrap_or(true);
@@ -608,12 +611,43 @@ async fn v1_chat_completions_handler(
         let mut _success_cookie: Option<String> = None;
 
         for cookie in &cookie_values {
+            let (allowed_tool_ids, forced_tool_id) =
+                match resolve_tool_selection_for_cookie(
+                    &state.http_client,
+                    &state.settings,
+                    cookie,
+                    &requested_tool_names,
+                    forced_tool_name.as_deref(),
+                )
+                .await
+                {
+                    Ok(selection) => selection,
+                    Err(err) => {
+                        let err_msg = onyx_client::format_error_chain(&err);
+                        let cookie_fp = crate::cookie_manager::fingerprint(cookie);
+                        error!(
+                            endpoint = "/v1/chat/completions",
+                            mode = "stream",
+                            cookie = %cookie_fp,
+                            error = %err_msg,
+                            "tool translation failed"
+                        );
+                        let mut cm = state.cookie_manager.write().await;
+                        cm.mark_call_failure(cookie, err_msg.clone());
+                        cm.save();
+                        last_err = err_msg;
+                        continue;
+                    }
+                };
+
             match onyx_client::streaming_chat(
                 &state.http_client,
                 &state.settings,
                 cookie,
                 &req.messages,
                 &model,
+                allowed_tool_ids.as_deref(),
+                forced_tool_id,
             )
             .await
             {
@@ -772,9 +806,44 @@ async fn v1_chat_completions_handler(
 
     let mut last_err = String::from("unknown upstream error");
     for cookie in cookie_values {
-        match onyx_client::full_chat(&state.http_client, &state.settings, &cookie, &req.messages, &model)
-            .await
+        let (allowed_tool_ids, forced_tool_id) = match resolve_tool_selection_for_cookie(
+            &state.http_client,
+            &state.settings,
+            &cookie,
+            &requested_tool_names,
+            forced_tool_name.as_deref(),
+        )
+        .await
         {
+            Ok(selection) => selection,
+            Err(err) => {
+                let err_msg = onyx_client::format_error_chain(&err);
+                let cookie_fp = crate::cookie_manager::fingerprint(&cookie);
+                error!(
+                    endpoint = "/v1/chat/completions",
+                    mode = "non_stream",
+                    cookie = %cookie_fp,
+                    error = %err_msg,
+                    "tool translation failed"
+                );
+                let mut cm = state.cookie_manager.write().await;
+                cm.mark_call_failure(&cookie, err_msg.clone());
+                cm.save();
+                last_err = err_msg;
+                continue;
+            }
+        };
+
+        match onyx_client::full_chat(
+            &state.http_client,
+            &state.settings,
+            &cookie,
+            &req.messages,
+            &model,
+            allowed_tool_ids.as_deref(),
+            forced_tool_id,
+        )
+        .await {
             Ok((content, thinking)) => {
                 let mut cm = state.cookie_manager.write().await;
                 cm.mark_call_success(&cookie);
@@ -986,6 +1055,8 @@ async fn v1_messages_handler(
     }
 
     let model = req.model.clone();
+    let requested_tool_names = req.requested_tool_names();
+    let forced_tool_name = req.forced_tool_name();
 
     // Estimate input tokens (rough estimation: 1 token ~= 4 chars)
     let input_tokens = {
@@ -1018,12 +1089,43 @@ async fn v1_messages_handler(
         let mut rx_opt: Option<tokio::sync::mpsc::Receiver<StreamEvent>> = None;
 
         for cookie in &cookie_values {
+            let (allowed_tool_ids, forced_tool_id) =
+                match resolve_tool_selection_for_cookie(
+                    &state.http_client,
+                    &state.settings,
+                    cookie,
+                    &requested_tool_names,
+                    forced_tool_name.as_deref(),
+                )
+                .await
+                {
+                    Ok(selection) => selection,
+                    Err(err) => {
+                        let err_msg = onyx_client::format_error_chain(&err);
+                        let cookie_fp = crate::cookie_manager::fingerprint(cookie);
+                        error!(
+                            endpoint = "/v1/messages",
+                            mode = "stream",
+                            cookie = %cookie_fp,
+                            error = %err_msg,
+                            "tool translation failed"
+                        );
+                        let mut cm = state.cookie_manager.write().await;
+                        cm.mark_call_failure(cookie, err_msg.clone());
+                        cm.save();
+                        last_err = err_msg;
+                        continue;
+                    }
+                };
+
             match onyx_client::streaming_chat(
                 &state.http_client,
                 &state.settings,
                 cookie,
                 &chat_messages,
                 &model,
+                allowed_tool_ids.as_deref(),
+                forced_tool_id,
             )
             .await
             {
@@ -1179,12 +1281,42 @@ async fn v1_messages_handler(
     let mut last_err = String::from("unknown upstream error");
 
     for cookie in &cookie_values {
+        let (allowed_tool_ids, forced_tool_id) = match resolve_tool_selection_for_cookie(
+            &state.http_client,
+            &state.settings,
+            cookie,
+            &requested_tool_names,
+            forced_tool_name.as_deref(),
+        )
+        .await
+        {
+            Ok(selection) => selection,
+            Err(err) => {
+                let err_msg = onyx_client::format_error_chain(&err);
+                let cookie_fp = crate::cookie_manager::fingerprint(cookie);
+                error!(
+                    endpoint = "/v1/messages",
+                    mode = "non_stream",
+                    cookie = %cookie_fp,
+                    error = %err_msg,
+                    "tool translation failed"
+                );
+                let mut cm = state.cookie_manager.write().await;
+                cm.mark_call_failure(cookie, err_msg.clone());
+                cm.save();
+                last_err = err_msg;
+                continue;
+            }
+        };
+
         match onyx_client::full_chat(
             &state.http_client,
             &state.settings,
             cookie,
             &chat_messages,
             &model,
+            allowed_tool_ids.as_deref(),
+            forced_tool_id,
         )
         .await
         {
@@ -1234,6 +1366,25 @@ async fn v1_messages_handler(
         Json(json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}})),
     )
         .into_response()
+}
+
+async fn resolve_tool_selection_for_cookie(
+    http_client: &reqwest::Client,
+    settings: &Settings,
+    cookie: &str,
+    requested_tool_names: &[String],
+    forced_tool_name: Option<&str>,
+) -> anyhow::Result<(Option<Vec<i64>>, Option<i64>)> {
+    if requested_tool_names.is_empty() && forced_tool_name.is_none() {
+        return Ok((None, None));
+    }
+
+    let available_tools = onyx_client::fetch_available_tools(http_client, settings, cookie).await?;
+    Ok(onyx_client::resolve_tool_selection_by_name(
+        &available_tools,
+        requested_tool_names,
+        forced_tool_name,
+    ))
 }
 
 fn ensure_authorized(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
