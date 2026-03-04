@@ -1,6 +1,8 @@
 use anyhow::{Context, anyhow};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -8,36 +10,131 @@ use crate::{
     models::{ChatMessage, DEFAULT_MODEL},
 };
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct OnyxToolMetadata {
+    pub id: i64,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub in_code_tool_id: Option<String>,
+}
+
+pub async fn fetch_available_tools(
+    client: &reqwest::Client,
+    settings: &Settings,
+    cookie: &str,
+) -> anyhow::Result<Vec<OnyxToolMetadata>> {
+    let response = client
+        .get(format!("{}/api/tool", settings.onyx_base_url))
+        .header("Cookie", format!("fastapiusersauth={cookie}"))
+        .header("Origin", &settings.onyx_origin_url)
+        .header("Referer", &settings.onyx_referer)
+        .send()
+        .await
+        .context("failed to call tool catalog endpoint")?;
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+        || response.status() == reqwest::StatusCode::FORBIDDEN
+    {
+        return Err(anyhow!("onyx auth failed: {}", response.status().as_u16()));
+    }
+
+    if !response.status().is_success() {
+        let code = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("onyx tool catalog HTTP {code}: {body}"));
+    }
+
+    let payload: Value = response
+        .json()
+        .await
+        .context("invalid tool catalog response json")?;
+    parse_tool_catalog_response(payload)
+}
+
+pub fn resolve_tool_selection_by_name(
+    available_tools: &[OnyxToolMetadata],
+    requested_tool_names: &[String],
+    forced_tool_name: Option<&str>,
+) -> (Option<Vec<i64>>, Option<i64>) {
+    let mut lookup = HashMap::<String, i64>::new();
+
+    for tool in available_tools {
+        for candidate in [
+            tool.name.as_deref(),
+            tool.display_name.as_deref(),
+            tool.in_code_tool_id.as_deref(),
+        ] {
+            let Some(name) = candidate else {
+                continue;
+            };
+            let normalized = normalize_tool_name(name);
+            if normalized.is_empty() {
+                continue;
+            }
+            lookup.entry(normalized).or_insert(tool.id);
+        }
+    }
+
+    let mut allowed_ids = Vec::new();
+    for name in requested_tool_names {
+        let normalized = normalize_tool_name(name);
+        if normalized.is_empty() {
+            continue;
+        }
+        if let Some(id) = lookup.get(&normalized)
+            && !allowed_ids.contains(id)
+        {
+            allowed_ids.push(*id);
+        }
+    }
+
+    let forced_tool_id = forced_tool_name.and_then(|name| {
+        let normalized = normalize_tool_name(name);
+        if normalized.is_empty() {
+            None
+        } else {
+            lookup.get(&normalized).copied()
+        }
+    });
+
+    if let Some(forced_id) = forced_tool_id
+        && !allowed_ids.contains(&forced_id)
+    {
+        allowed_ids.push(forced_id);
+    }
+
+    let allowed_tool_ids = if allowed_ids.is_empty() {
+        None
+    } else {
+        Some(allowed_ids)
+    };
+
+    (allowed_tool_ids, forced_tool_id)
+}
+
 pub async fn full_chat(
     client: &reqwest::Client,
     settings: &Settings,
     cookie: &str,
     messages: &[ChatMessage],
     model_name: &str,
+    allowed_tool_ids: Option<&[i64]>,
+    forced_tool_id: Option<i64>,
 ) -> anyhow::Result<(String, String)> {
     let chat_session_id = create_chat_session(client, settings, cookie).await?;
     let (provider, version) = resolve_model(model_name);
-
-    let payload = serde_json::json!({
-        "message": build_prompt(messages),
-        "chat_session_id": chat_session_id,
-        "parent_message_id": null,
-        "file_descriptors": [],
-        "internal_search_filters": {
-            "source_type": null,
-            "document_set": null,
-            "time_cutoff": null,
-            "tags": []
-        },
-        "deep_research": false,
-        "forced_tool_id": null,
-        "llm_override": {
-            "temperature": 0.5,
-            "model_provider": provider,
-            "model_version": version
-        },
-        "origin": settings.onyx_origin,
-    });
+    let payload = build_send_chat_payload(
+        messages,
+        &chat_session_id,
+        &provider,
+        &version,
+        settings,
+        allowed_tool_ids,
+        forced_tool_id,
+    );
 
     let response = client
         .post(format!("{}/api/chat/send-chat-message", settings.onyx_base_url))
@@ -112,30 +209,20 @@ pub async fn streaming_chat(
     cookie: &str,
     messages: &[ChatMessage],
     model_name: &str,
+    allowed_tool_ids: Option<&[i64]>,
+    forced_tool_id: Option<i64>,
 ) -> anyhow::Result<mpsc::Receiver<StreamEvent>> {
     let chat_session_id = create_chat_session(client, settings, cookie).await?;
     let (provider, version) = resolve_model(model_name);
-
-    let payload = serde_json::json!({
-        "message": build_prompt(messages),
-        "chat_session_id": chat_session_id,
-        "parent_message_id": null,
-        "file_descriptors": [],
-        "internal_search_filters": {
-            "source_type": null,
-            "document_set": null,
-            "time_cutoff": null,
-            "tags": []
-        },
-        "deep_research": false,
-        "forced_tool_id": null,
-        "llm_override": {
-            "temperature": 0.5,
-            "model_provider": provider,
-            "model_version": version
-        },
-        "origin": settings.onyx_origin,
-    });
+    let payload = build_send_chat_payload(
+        messages,
+        &chat_session_id,
+        &provider,
+        &version,
+        settings,
+        allowed_tool_ids,
+        forced_tool_id,
+    );
 
     let response = client
         .post(format!("{}/api/chat/send-chat-message", settings.onyx_base_url))
@@ -280,6 +367,64 @@ fn parse_onyx_stream_text(text: &str) -> (String, String) {
     (content, thinking)
 }
 
+fn build_send_chat_payload(
+    messages: &[ChatMessage],
+    chat_session_id: &str,
+    provider: &str,
+    version: &str,
+    settings: &Settings,
+    allowed_tool_ids: Option<&[i64]>,
+    forced_tool_id: Option<i64>,
+) -> Value {
+    serde_json::json!({
+        "message": build_prompt(messages),
+        "chat_session_id": chat_session_id,
+        "parent_message_id": null,
+        "file_descriptors": [],
+        "internal_search_filters": {
+            "source_type": null,
+            "document_set": null,
+            "time_cutoff": null,
+            "tags": []
+        },
+        "deep_research": false,
+        "allowed_tool_ids": allowed_tool_ids.map(|ids| ids.to_vec()),
+        "forced_tool_id": forced_tool_id,
+        "llm_override": {
+            "temperature": 0.5,
+            "model_provider": provider,
+            "model_version": version
+        },
+        "origin": settings.onyx_origin,
+    })
+}
+
+fn parse_tool_catalog_response(payload: Value) -> anyhow::Result<Vec<OnyxToolMetadata>> {
+    match payload {
+        Value::Array(_) => serde_json::from_value(payload).context("tool catalog array parse failed"),
+        Value::Object(map) => {
+            for key in ["tools", "items", "data"] {
+                if let Some(value) = map.get(key)
+                    && value.is_array()
+                {
+                    return serde_json::from_value(value.clone())
+                        .context("tool catalog object array parse failed");
+                }
+            }
+            Err(anyhow!("unexpected tool catalog response shape"))
+        }
+        _ => Err(anyhow!("unexpected tool catalog response type")),
+    }
+}
+
+fn normalize_tool_name(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 async fn create_chat_session(
     client: &reqwest::Client,
     settings: &Settings,
@@ -368,6 +513,7 @@ fn resolve_model(model_name: &str) -> (String, String) {
 mod tests {
     use anyhow::anyhow;
     use crate::models::ChatMessage;
+    use serde_json::json;
 
     use super::{build_prompt, parse_onyx_stream_text};
 
@@ -432,5 +578,52 @@ data: [DONE]"#;
         ]);
 
         assert_eq!(prompt, "user: hello\nuser: result text");
+    }
+
+    #[test]
+    fn resolve_tool_selection_maps_tool_names_and_forced_name() {
+        let tools = vec![
+            super::OnyxToolMetadata {
+                id: 11,
+                name: Some("web_search".to_string()),
+                display_name: Some("Web Search".to_string()),
+                in_code_tool_id: Some("WebSearchTool".to_string()),
+            },
+            super::OnyxToolMetadata {
+                id: 22,
+                name: Some("shell".to_string()),
+                display_name: Some("Shell".to_string()),
+                in_code_tool_id: Some("PythonTool".to_string()),
+            },
+        ];
+
+        let requested = vec!["web-search".to_string(), "shell".to_string()];
+        let (allowed, forced) =
+            super::resolve_tool_selection_by_name(&tools, &requested, Some("WebSearchTool"));
+
+        assert_eq!(allowed, Some(vec![11, 22]));
+        assert_eq!(forced, Some(11));
+    }
+
+    #[test]
+    fn build_send_chat_payload_includes_tool_id_fields() {
+        let settings = crate::config::Settings::default();
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        let payload = super::build_send_chat_payload(
+            &messages,
+            "chat-session-1",
+            "Anthropic",
+            "claude-opus-4-6",
+            &settings,
+            Some(&[11, 22]),
+            Some(22),
+        );
+
+        assert_eq!(payload["allowed_tool_ids"], json!([11, 22]));
+        assert_eq!(payload["forced_tool_id"], json!(22));
     }
 }

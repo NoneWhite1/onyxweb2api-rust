@@ -27,6 +27,98 @@ pub struct ChatCompletionRequest {
     pub model: Option<String>,
     pub stream: Option<bool>,
     pub include_reasoning: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<Vec<OpenAIToolDefinition>>,
+    #[serde(default)]
+    pub tool_choice: Option<OpenAIToolChoice>,
+}
+
+impl ChatCompletionRequest {
+    pub fn requested_tool_names(&self) -> Vec<String> {
+        self.tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        if let Some(function) = &tool.function {
+                            non_empty_trimmed(function.name.as_str())
+                        } else if let Some(name) = &tool.name {
+                            non_empty_trimmed(name)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn forced_tool_name(&self) -> Option<String> {
+        let choice = self.tool_choice.as_ref()?;
+        match choice {
+            OpenAIToolChoice::String(_) => None,
+            OpenAIToolChoice::Object(obj) => {
+                if let Some(function) = &obj.function {
+                    non_empty_trimmed(function.name.as_str())
+                } else if let Some(name) = &obj.name {
+                    non_empty_trimmed(name)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAIToolDefinition {
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub function: Option<OpenAIFunctionDefinition>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAIFunctionDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAIToolChoice {
+    String(String),
+    Object(OpenAIToolChoiceObject),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAIToolChoiceObject {
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub function: Option<OpenAIFunctionChoice>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAIFunctionChoice {
+    pub name: String,
+}
+
+fn non_empty_trimmed(input: &str) -> Option<String> {
+    let value = input.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +209,76 @@ pub struct ClaudeMessagesRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub tools: Option<Vec<ClaudeToolDefinition>>,
+    #[serde(default)]
+    pub tool_choice: Option<ClaudeToolChoice>,
+}
+
+impl ClaudeMessagesRequest {
+    pub fn requested_tool_names(&self) -> Vec<String> {
+        self.tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| non_empty_trimmed(tool.name.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn forced_tool_name(&self) -> Option<String> {
+        let choice = self.tool_choice.as_ref()?;
+        match choice {
+            ClaudeToolChoice::String(value) => {
+                let lower = value.trim().to_ascii_lowercase();
+                if lower == "auto" || lower == "any" || lower == "none" || lower == "required" {
+                    None
+                } else {
+                    non_empty_trimmed(value)
+                }
+            }
+            ClaudeToolChoice::Object(choice_obj) => {
+                let kind = choice_obj
+                    .type_field
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+
+                if kind.is_empty() || kind == "tool" {
+                    choice_obj.name.as_ref().and_then(|name| non_empty_trimmed(name))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeToolDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ClaudeToolChoice {
+    String(String),
+    Object(ClaudeToolChoiceObject),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeToolChoiceObject {
+    #[serde(default, rename = "type")]
+    pub type_field: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -312,7 +474,7 @@ pub struct ClaudeStreamMessageStop {
 
 #[cfg(test)]
 mod tests {
-    use super::ClaudeMessage;
+    use super::{ChatCompletionRequest, ClaudeMessage, ClaudeMessagesRequest};
 
     #[test]
     fn claude_content_ignores_tool_use_blocks() {
@@ -372,5 +534,49 @@ mod tests {
             msg.content.is_empty(),
             "non-text tool_result metadata should not be forwarded"
         );
+    }
+
+    #[test]
+    fn claude_request_extracts_tools_and_forced_tool_name() {
+        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4.6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+            "tools": [
+                {"name": "shell", "description": "Run shell", "input_schema": {"type": "object"}},
+                {"name": "web_search", "description": "Search the web", "input_schema": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "tool", "name": "shell"}
+        }))
+        .expect("should deserialize ClaudeMessagesRequest");
+
+        assert_eq!(req.requested_tool_names(), vec!["shell", "web_search"]);
+        assert_eq!(req.forced_tool_name().as_deref(), Some("shell"));
+    }
+
+    #[test]
+    fn chat_completions_request_extracts_openai_forced_tool_name() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "description": "Run shell",
+                        "parameters": {"type": "object"}
+                    }
+                }
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "shell"}
+            }
+        }))
+        .expect("should deserialize ChatCompletionRequest");
+
+        assert_eq!(req.requested_tool_names(), vec!["shell"]);
+        assert_eq!(req.forced_tool_name().as_deref(), Some("shell"));
     }
 }
