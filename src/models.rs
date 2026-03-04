@@ -200,8 +200,6 @@ fn extract_text_from_blocks(arr: &[serde_json::Value]) -> String {
                         && !text.is_empty()
                     {
                         parts.push(text.to_string());
-                    } else {
-                        parts.push(content.to_string());
                     }
                 }
                 _ => {}
@@ -210,12 +208,7 @@ fn extract_text_from_blocks(arr: &[serde_json::Value]) -> String {
         }
 
         if let Some("tool_use") = block.get("type").and_then(Value::as_str) {
-            let name = block
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown_tool");
-            let input = block.get("input").cloned().unwrap_or(Value::Null);
-            parts.push(format!("[tool_use name={name} input={input}]"));
+            continue;
         }
     }
 
@@ -315,4 +308,69 @@ pub struct ClaudeStopDelta {
 pub struct ClaudeStreamMessageStop {
     #[serde(rename = "type")]
     pub type_field: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClaudeMessage;
+
+    #[test]
+    fn claude_content_ignores_tool_use_blocks() {
+        let msg: ClaudeMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "shell",
+                    "input": { "cmd": "pwd" }
+                }
+            ]
+        }))
+        .expect("should deserialize ClaudeMessage");
+
+        assert!(msg.content.is_empty(), "tool_use should not be forwarded as prompt text");
+    }
+
+    #[test]
+    fn claude_content_keeps_only_tool_result_text() {
+        let msg: ClaudeMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": {
+                        "text": "/home/nonewhite"
+                    }
+                }
+            ]
+        }))
+        .expect("should deserialize ClaudeMessage");
+
+        assert_eq!(msg.content, "/home/nonewhite");
+    }
+
+    #[test]
+    fn claude_content_drops_tool_result_object_without_text() {
+        let msg: ClaudeMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": {
+                        "exit_code": 0,
+                        "stdout": "ok"
+                    }
+                }
+            ]
+        }))
+        .expect("should deserialize ClaudeMessage");
+
+        assert!(
+            msg.content.is_empty(),
+            "non-text tool_result metadata should not be forwarded"
+        );
+    }
 }

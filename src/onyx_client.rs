@@ -330,7 +330,14 @@ pub fn build_prompt(messages: &[ChatMessage]) -> String {
     }
     messages
         .iter()
-        .map(|m| format!("{}: {}", m.role, m.content))
+        .filter_map(|m| {
+            let content = m.content.trim();
+            if content.is_empty() {
+                None
+            } else {
+                Some(format!("{}: {}", m.role, content))
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -360,8 +367,9 @@ fn resolve_model(model_name: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
+    use crate::models::ChatMessage;
 
-    use super::parse_onyx_stream_text;
+    use super::{build_prompt, parse_onyx_stream_text};
 
     #[test]
     fn parses_nested_obj_event_format() {
@@ -404,5 +412,25 @@ data: [DONE]"#;
             rendered.contains("root_cause:"),
             "should explicitly mark root cause"
         );
+    }
+
+    #[test]
+    fn build_prompt_skips_empty_content_messages() {
+        let prompt = build_prompt(&[
+            ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "result text".to_string(),
+            },
+        ]);
+
+        assert_eq!(prompt, "user: hello\nuser: result text");
     }
 }
