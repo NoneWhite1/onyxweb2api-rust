@@ -541,6 +541,83 @@ async fn claude_messages_upstream_error_includes_reason_chain() {
 }
 
 #[tokio::test]
+async fn claude_messages_tools_payload_with_system_blocks_does_not_422() {
+    let app = test_router_with_invalid_upstream();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"claude-opus-4.6",
+                        "system":[{"type":"text","text":"You are a tool-using assistant."}],
+                        "messages":[
+                          {
+                            "role":"assistant",
+                            "content":[
+                              {"type":"tool_use","id":"toolu_1","name":"shell","input":{"cmd":"pwd"}}
+                            ]
+                          },
+                          {
+                            "role":"user",
+                            "content":[
+                              {"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"/home/nonewhite"}]}
+                            ]
+                          }
+                        ],
+                        "tools":[{"name":"shell","description":"run shell","input_schema":{"type":"object"}}],
+                        "max_tokens":1024
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn claude_messages_invalid_json_returns_reason_text() {
+    let app = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"claude-opus-4.6",
+                        "system":{"type":"text","text":"invalid-shape"},
+                        "messages":[{"role":"user","content":"hello"}],
+                        "max_tokens":1024
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let body = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+
+    assert!(
+        message.contains("invalid request body:"),
+        "422 response should include parse reason prefix: {message}"
+    );
+}
+
+#[tokio::test]
 async fn claude_messages_streaming() {
     let app = test_router();
 

@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{Html, IntoResponse, Sse, sse::Event},
     routing::{delete, get, post},
@@ -927,7 +927,7 @@ async fn refresh_cookies_handler(
 async fn v1_messages_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(req): Json<ClaudeMessagesRequest>,
+    payload: Result<Json<ClaudeMessagesRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     // Claude uses x-api-key header instead of Bearer token
     if let Some(expected) = &state.settings.api_key {
@@ -944,6 +944,23 @@ async fn v1_messages_handler(
                 .into_response();
         }
     }
+
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rej) => {
+            let reason = rej.body_text();
+            error!(
+                endpoint = "/v1/messages",
+                error = %reason,
+                "claude request deserialization failed"
+            );
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"type":"error","error":{"type":"invalid_request_error","message":format!("invalid request body: {reason}")}})),
+            )
+                .into_response();
+        }
+    };
 
     if req.messages.is_empty() {
         return (

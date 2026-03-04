@@ -111,7 +111,7 @@ pub struct ClaudeMessagesRequest {
     pub messages: Vec<ClaudeMessage>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_claude_system")]
     pub system: Option<String>,
     #[serde(default)]
     pub stream: Option<bool>,
@@ -121,6 +121,29 @@ pub struct ClaudeMessagesRequest {
 
 fn default_max_tokens() -> u32 {
     4096
+}
+
+fn deserialize_claude_system<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    use serde_json::Value;
+
+    let v = Option::<Value>::deserialize(d)?;
+    match v {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Array(arr)) => {
+            let text = extract_text_from_blocks(&arr);
+            if text.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(text))
+            }
+        }
+        Some(_) => Err(de::Error::custom("system must be string or array")),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,17 +165,51 @@ where
     let v = Value::deserialize(d)?;
     match v {
         Value::String(s) => Ok(s),
-        Value::Array(arr) => {
-            let mut text = String::new();
-            for block in arr {
-                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                    text.push_str(t);
-                }
-            }
-            Ok(text)
-        }
+        Value::Array(arr) => Ok(extract_text_from_blocks(&arr)),
         _ => Err(de::Error::custom("content must be string or array")),
     }
+}
+
+fn extract_text_from_blocks(arr: &[serde_json::Value]) -> String {
+    use serde_json::Value;
+
+    let mut parts = Vec::new();
+
+    for block in arr {
+        if let Some(t) = block.get("text").and_then(Value::as_str)
+            && !t.is_empty()
+        {
+            parts.push(t.to_string());
+            continue;
+        }
+
+        if let Some("tool_result") = block.get("type").and_then(Value::as_str)
+            && let Some(content) = block.get("content")
+        {
+            match content {
+                Value::String(s) if !s.is_empty() => parts.push(s.clone()),
+                Value::Array(nested) => {
+                    let nested_text = extract_text_from_blocks(nested);
+                    if !nested_text.is_empty() {
+                        parts.push(nested_text);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if let Some("tool_use") = block.get("type").and_then(Value::as_str) {
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_tool");
+            let input = block.get("input").cloned().unwrap_or(Value::Null);
+            parts.push(format!("[tool_use name={name} input={input}]"));
+        }
+    }
+
+    parts.join("\n")
 }
 
 #[derive(Debug, Serialize)]
