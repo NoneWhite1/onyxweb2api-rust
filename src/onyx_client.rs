@@ -123,12 +123,56 @@ pub async fn full_chat(
         forced_tool_id,
     );
 
+    let text = send_chat_message_text(client, settings, cookie, &payload).await?;
+    let (content, thinking) = parse_onyx_stream_text(&text);
+
+    if content.is_empty() && thinking.is_empty() {
+        let snippet = text.chars().take(500).collect::<String>();
+        return Err(anyhow!("empty upstream response: {snippet}"));
+    }
+
+    if should_retry_python_syntax_error(&content) {
+        let mut retry_messages = messages.to_vec();
+        retry_messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: "The previous Python sandbox run failed with SyntaxError. Retry once with syntactically valid Python code and return the final answer.".to_string(),
+        });
+
+        let retry_payload = build_send_chat_payload(
+            &retry_messages,
+            &chat_session_id,
+            &provider,
+            &version,
+            settings,
+            allowed_tool_ids,
+            forced_tool_id,
+        );
+
+        if let Ok(retry_text) = send_chat_message_text(client, settings, cookie, &retry_payload).await {
+            let (retry_content, retry_thinking) = parse_onyx_stream_text(&retry_text);
+            if !(retry_content.is_empty() && retry_thinking.is_empty())
+                && !should_retry_python_syntax_error(&retry_content)
+            {
+                return Ok((retry_content, retry_thinking));
+            }
+        }
+    }
+
+    Ok((content, thinking))
+}
+
+async fn send_chat_message_text(
+    client: &reqwest::Client,
+    settings: &Settings,
+    cookie: &str,
+    payload: &Value,
+) -> anyhow::Result<String> {
     let response = client
         .post(format!("{}/api/chat/send-chat-message", settings.onyx_base_url))
         .header("Cookie", format!("fastapiusersauth={cookie}"))
         .header("Origin", &settings.onyx_origin_url)
         .header("Referer", &settings.onyx_referer)
-        .json(&payload)
+        .json(payload)
         .send()
         .await
         .context("failed to call send-chat-message")?;
@@ -145,15 +189,16 @@ pub async fn full_chat(
         return Err(anyhow!("onyx send-chat-message HTTP {code}: {body}"));
     }
 
-    let text = response.text().await.context("failed to read response body")?;
-    let (content, thinking) = parse_onyx_stream_text(&text);
+    response
+        .text()
+        .await
+        .context("failed to read response body")
+}
 
-    if content.is_empty() && thinking.is_empty() {
-        let snippet = text.chars().take(500).collect::<String>();
-        return Err(anyhow!("empty upstream response: {snippet}"));
-    }
-
-    Ok((content, thinking))
+fn should_retry_python_syntax_error(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("syntaxerror")
+        && (lower.contains("python") || lower.contains("code interpreter"))
 }
 
 /// SSE event types emitted by streaming_chat
@@ -667,5 +712,17 @@ data: [DONE]"#;
 
         assert_eq!(payload["allowed_tool_ids"], json!([11, 22]));
         assert_eq!(payload["forced_tool_id"], json!(22));
+    }
+
+    #[test]
+    fn retry_trigger_detects_python_syntax_error() {
+        let msg = "Python execution failed: SyntaxError: invalid syntax";
+        assert!(super::should_retry_python_syntax_error(msg));
+    }
+
+    #[test]
+    fn retry_trigger_ignores_non_syntaxerror_content() {
+        let msg = "Python tool completed successfully.";
+        assert!(!super::should_retry_python_syntax_error(msg));
     }
 }
