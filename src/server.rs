@@ -941,6 +941,15 @@ async fn v1_messages_handler(
 
     let model = req.model.clone();
 
+    // Estimate input tokens (rough estimation: 1 token ~= 4 chars)
+    let input_tokens = {
+        let mut chars = req.system.as_ref().map(|s| s.len()).unwrap_or(0);
+        for m in &req.messages {
+            chars += m.role.len() + m.content.len() + 4;
+        }
+        (chars / 4) as u32 + 10 // +10 for structural overhead
+    };
+
     let cookie_values = {
         let cm = state.cookie_manager.read().await;
         cm.active_cookie_values()
@@ -998,14 +1007,14 @@ async fn v1_messages_handler(
         };
 
         // Build SSE stream for Claude format
-        // State: (rx, msg_id, model, phase, content_index, output_tokens)
-        // phase: 0=start, 1=streaming, 2=done
+        // State: (rx, msg_id, model, phase, output_tokens, input_tokens, buffer)
+        // phase: 0=message_start, 1=content_block_start, 2=streaming, 3=content_block_stop, 4=message_delta, 5=message_stop
         let sse_stream = stream::unfold(
-            (rx, msg_id, model_for_stream, 0u8, 0u32),
-            |(mut rx, msg_id, model, phase, output_tokens)| async move {
+            (rx, msg_id, model_for_stream, 0u8, 0u32, input_tokens, None::<StreamEvent>),
+            |(mut rx, msg_id, model, phase, output_tokens, input_tokens, mut event_buffer)| async move {
                 match phase {
                     0 => {
-                        // Emit message_start + content_block_start
+                        // Emit message_start
                         let start = ClaudeStreamMessageStart {
                             type_field: "message_start",
                             message: ClaudeStreamMessageMeta {
@@ -1016,88 +1025,39 @@ async fn v1_messages_handler(
                                 model: model.clone(),
                                 stop_reason: None,
                                 usage: ClaudeUsage {
-                                    input_tokens: 0,
+                                    input_tokens,
                                     output_tokens: 0,
                                 },
                             },
                         };
-                        let start_data = serde_json::to_string(&start).unwrap_or_default();
-                        let event = Event::default()
-                            .event("message_start")
-                            .data(start_data);
-                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 1, output_tokens)))
+                        let data = serde_json::to_string(&start).unwrap_or_default();
+                        let event = Event::default().event("message_start").data(data);
+                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 1, output_tokens, input_tokens, None)))
                     }
                     1 => {
-                        // Wait for first real content event to emit content_block_start
-                        match rx.recv().await {
-                            Some(StreamEvent::Role) => {
-                                let block_start = ClaudeStreamContentBlockStart {
-                                    type_field: "content_block_start",
-                                    index: 0,
-                                    content_block: ClaudeContentBlock {
-                                        type_field: "text",
-                                        text: String::new(),
-                                    },
-                                };
-                                let data = serde_json::to_string(&block_start).unwrap_or_default();
-                                let event = Event::default()
-                                    .event("content_block_start")
-                                    .data(data);
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens)))
-                            }
-                            Some(StreamEvent::Content(_text)) => {
-                                // No role event, jump to content_block_start + delta
-                                let block_start = ClaudeStreamContentBlockStart {
-                                    type_field: "content_block_start",
-                                    index: 0,
-                                    content_block: ClaudeContentBlock {
-                                        type_field: "text",
-                                        text: String::new(),
-                                    },
-                                };
-                                let data = serde_json::to_string(&block_start).unwrap_or_default();
-                                let event = Event::default()
-                                    .event("content_block_start")
-                                    .data(data);
-                                // We'll emit the first delta on the next call — put content back
-                                // Actually we can't put it back. Emit combined.
-                                // Let's emit block_start first, delta will come next iteration
-                                // For simplicity, put text into output_tokens as marker
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens)))
-                            }
-                            Some(StreamEvent::Reasoning(_)) => {
-                                // Skip reasoning for now in Claude format (or emit as thinking block)
-                                let block_start = ClaudeStreamContentBlockStart {
-                                    type_field: "content_block_start",
-                                    index: 0,
-                                    content_block: ClaudeContentBlock {
-                                        type_field: "text",
-                                        text: String::new(),
-                                    },
-                                };
-                                let data = serde_json::to_string(&block_start).unwrap_or_default();
-                                let event = Event::default()
-                                    .event("content_block_start")
-                                    .data(data);
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens)))
-                            }
-                            Some(StreamEvent::Done) | None => {
-                                // No content at all, close
-                                let stop = ClaudeStreamMessageStop {
-                                    type_field: "message_stop",
-                                };
-                                let data = serde_json::to_string(&stop).unwrap_or_default();
-                                let event = Event::default()
-                                    .event("message_stop")
-                                    .data(data);
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 99, output_tokens)))
-                            }
-                        }
+                        // Emit content_block_start
+                        let block_start = ClaudeStreamContentBlockStart {
+                            type_field: "content_block_start",
+                            index: 0,
+                            content_block: ClaudeContentBlock {
+                                type_field: "text",
+                                text: String::new(),
+                            },
+                        };
+                        let data = serde_json::to_string(&block_start).unwrap_or_default();
+                        let event = Event::default().event("content_block_start").data(data);
+                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens, input_tokens, None)))
                     }
                     2 => {
-                        // Main content streaming phase
-                        match rx.recv().await {
-                            Some(StreamEvent::Content(text)) => {
+                        // Streaming content_block_delta
+                        let event = if let Some(e) = event_buffer.take() {
+                            Some(e)
+                        } else {
+                            rx.recv().await
+                        };
+
+                        match event {
+                            Some(StreamEvent::Content(text)) | Some(StreamEvent::Reasoning(text)) => {
                                 let new_tokens = output_tokens + 1;
                                 let delta = ClaudeStreamContentBlockDelta {
                                     type_field: "content_block_delta",
@@ -1108,48 +1068,27 @@ async fn v1_messages_handler(
                                     },
                                 };
                                 let data = serde_json::to_string(&delta).unwrap_or_default();
-                                let event = Event::default()
-                                    .event("content_block_delta")
-                                    .data(data);
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, new_tokens)))
-                            }
-                            Some(StreamEvent::Reasoning(text)) => {
-                                // Emit reasoning as content_block_delta with text for now
-                                let new_tokens = output_tokens + 1;
-                                let delta = ClaudeStreamContentBlockDelta {
-                                    type_field: "content_block_delta",
-                                    index: 0,
-                                    delta: ClaudeTextDelta {
-                                        type_field: "text_delta",
-                                        text,
-                                    },
-                                };
-                                let data = serde_json::to_string(&delta).unwrap_or_default();
-                                let event = Event::default()
-                                    .event("content_block_delta")
-                                    .data(data);
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, new_tokens)))
+                                let event = Event::default().event("content_block_delta").data(data);
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, new_tokens, input_tokens, None)))
                             }
                             Some(StreamEvent::Role) => {
-                                // Skip duplicate role events
+                                // Skip role event, stay in phase 2 and recv again
                                 let event = Event::default().event("ping").data("{\"type\":\"ping\"}");
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens)))
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens, input_tokens, None)))
                             }
                             Some(StreamEvent::Done) | None => {
-                                // Emit content_block_stop + message_delta + message_stop
+                                // Transition to content_block_stop
                                 let block_stop = ClaudeStreamContentBlockStop {
                                     type_field: "content_block_stop",
                                     index: 0,
                                 };
                                 let data = serde_json::to_string(&block_stop).unwrap_or_default();
-                                let event = Event::default()
-                                    .event("content_block_stop")
-                                    .data(data);
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 3, output_tokens)))
+                                let event = Event::default().event("content_block_stop").data(data);
+                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 4, output_tokens, input_tokens, None)))
                             }
                         }
                     }
-                    3 => {
+                    4 => {
                         // Emit message_delta
                         let msg_delta = ClaudeStreamMessageDelta {
                             type_field: "message_delta",
@@ -1157,28 +1096,24 @@ async fn v1_messages_handler(
                                 stop_reason: "end_turn",
                             },
                             usage: ClaudeUsage {
-                                input_tokens: 0,
+                                input_tokens,
                                 output_tokens,
                             },
                         };
                         let data = serde_json::to_string(&msg_delta).unwrap_or_default();
-                        let event = Event::default()
-                            .event("message_delta")
-                            .data(data);
-                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 4, output_tokens)))
+                        let event = Event::default().event("message_delta").data(data);
+                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 5, output_tokens, input_tokens, None)))
                     }
-                    4 => {
+                    5 => {
                         // Emit message_stop
                         let stop = ClaudeStreamMessageStop {
                             type_field: "message_stop",
                         };
                         let data = serde_json::to_string(&stop).unwrap_or_default();
-                        let event = Event::default()
-                            .event("message_stop")
-                            .data(data);
-                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 99, output_tokens)))
+                        let event = Event::default().event("message_stop").data(data);
+                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 99, output_tokens, input_tokens, None)))
                     }
-                    _ => None, // 99 = terminal
+                    _ => None, // terminal
                 }
             },
         );
@@ -1215,7 +1150,7 @@ async fn v1_messages_handler(
                     model: model.clone(),
                     stop_reason: "end_turn",
                     usage: ClaudeUsage {
-                        input_tokens: 0,
+                        input_tokens,
                         output_tokens: 0,
                     },
                 };
