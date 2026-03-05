@@ -290,6 +290,10 @@ impl ClaudeMessagesRequest {
             }
         }
     }
+
+    pub fn has_tool_result_message(&self) -> bool {
+        self.messages.iter().any(|message| message.has_tool_result)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -343,35 +347,56 @@ where
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ClaudeMessage {
     pub role: String,
-    #[serde(deserialize_with = "deserialize_claude_content")]
     pub content: String,
+    pub has_tool_result: bool,
 }
 
-/// Claude content can be a plain string or an array of content blocks.
-/// We normalise both to a single string.
-fn deserialize_claude_content<'de, D>(d: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de;
-    use serde_json::Value;
+impl<'de> Deserialize<'de> for ClaudeMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+        use serde_json::Value;
 
-    let v = Value::deserialize(d)?;
-    match v {
-        Value::String(s) => Ok(s),
-        Value::Array(arr) => Ok(extract_text_from_blocks(&arr)),
-        Value::Object(obj) => Ok(extract_text_from_blocks(&[Value::Object(obj)])),
-        _ => Err(de::Error::custom("content must be string, object, or array")),
+        #[derive(Deserialize)]
+        struct RawClaudeMessage {
+            role: String,
+            content: Value,
+        }
+
+        let raw = RawClaudeMessage::deserialize(deserializer)?;
+        let (content, has_tool_result) = match raw.content {
+            Value::String(s) => (s, false),
+            Value::Array(arr) => extract_text_and_flags_from_blocks(&arr),
+            Value::Object(obj) => extract_text_and_flags_from_blocks(&[Value::Object(obj)]),
+            _ => {
+                return Err(de::Error::custom(
+                    "content must be string, object, or array",
+                ));
+            }
+        };
+
+        Ok(Self {
+            role: raw.role,
+            content,
+            has_tool_result,
+        })
     }
 }
 
 fn extract_text_from_blocks(arr: &[serde_json::Value]) -> String {
+    extract_text_and_flags_from_blocks(arr).0
+}
+
+fn extract_text_and_flags_from_blocks(arr: &[serde_json::Value]) -> (String, bool) {
     use serde_json::Value;
 
     let mut parts = Vec::new();
+    let mut has_tool_result = false;
 
     for block in arr {
         if let Some(t) = block.get("text").and_then(Value::as_str)
@@ -384,10 +409,12 @@ fn extract_text_from_blocks(arr: &[serde_json::Value]) -> String {
         if let Some("tool_result") = block.get("type").and_then(Value::as_str)
             && let Some(content) = block.get("content")
         {
+            has_tool_result = true;
             match content {
                 Value::String(s) if !s.is_empty() => parts.push(s.clone()),
                 Value::Array(nested) => {
-                    let nested_text = extract_text_from_blocks(nested);
+                    let (nested_text, nested_has_tool_result) = extract_text_and_flags_from_blocks(nested);
+                    has_tool_result |= nested_has_tool_result;
                     if !nested_text.is_empty() {
                         parts.push(nested_text);
                     }
@@ -409,7 +436,7 @@ fn extract_text_from_blocks(arr: &[serde_json::Value]) -> String {
         }
     }
 
-    parts.join("\n")
+    (parts.join("\n"), has_tool_result)
 }
 
 #[derive(Debug, Serialize)]
@@ -534,6 +561,10 @@ mod tests {
         .expect("should deserialize ClaudeMessage");
 
         assert!(msg.content.is_empty(), "tool_use should not be forwarded as prompt text");
+        assert!(
+            !msg.has_tool_result,
+            "tool_use-only content should not mark tool_result presence"
+        );
     }
 
     #[test]
@@ -553,6 +584,10 @@ mod tests {
         .expect("should deserialize ClaudeMessage");
 
         assert_eq!(msg.content, "/home/nonewhite");
+        assert!(
+            msg.has_tool_result,
+            "tool_result content should mark tool_result presence"
+        );
     }
 
     #[test]
@@ -576,6 +611,10 @@ mod tests {
             msg.content.is_empty(),
             "non-text tool_result metadata should not be forwarded"
         );
+        assert!(
+            msg.has_tool_result,
+            "tool_result blocks should be tracked even if text payload is empty"
+        );
     }
 
     #[test]
@@ -594,6 +633,33 @@ mod tests {
 
         assert_eq!(req.requested_tool_names(), vec!["shell", "web_search"]);
         assert_eq!(req.forced_tool_name().as_deref(), Some("shell"));
+        assert!(!req.has_tool_result_message());
+    }
+
+    #[test]
+    fn claude_request_detects_tool_result_message_blocks() {
+        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "ok"
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 1024,
+            "tools": [
+                {"name": "bash", "description": "Run shell", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .expect("should deserialize ClaudeMessagesRequest");
+
+        assert!(req.has_tool_result_message());
     }
 
     #[test]

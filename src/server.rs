@@ -1835,6 +1835,10 @@ fn maybe_build_local_tool_call_from_chat_request(req: &ChatCompletionRequest) ->
 fn maybe_build_local_tool_call_from_claude_request(
     req: &ClaudeMessagesRequest,
 ) -> Option<LocalToolCall> {
+    if req.has_tool_result_message() {
+        return None;
+    }
+
     let tool_names = req.requested_tool_names();
     let user_message = req
         .messages
@@ -2125,5 +2129,36 @@ mod tests {
         assert_eq!(tool_call.name, "write");
         assert!(tool_call.arguments.contains("\"filePath\":\"1234.txt\""));
         assert!(tool_call.arguments.contains("\"content\":\"1234\""));
+    }
+
+    #[test]
+    fn claude_messages_with_tool_result_does_not_generate_local_tool_call() {
+        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "run: pwd"
+                        }
+                    ]
+                }
+            ],
+            "tools": [
+                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}}
+            ],
+            "max_tokens": 1024,
+            "stream": true
+        }))
+        .expect("request should deserialize");
+
+        let tool_call = maybe_build_local_tool_call_from_claude_request(&req);
+        assert!(
+            tool_call.is_none(),
+            "local tool call must be skipped when request already contains tool_result blocks"
+        );
     }
 }
