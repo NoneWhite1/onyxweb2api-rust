@@ -1261,6 +1261,7 @@ async fn v1_messages_handler(
     {
         let tool_input: serde_json::Value =
             serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
+        let tool_input_json = serde_json::to_string(&tool_input).unwrap_or_else(|_| "{}".to_string());
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
         let model_for_stream = model.clone();
         let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
@@ -1271,7 +1272,7 @@ async fn v1_messages_handler(
             let model = model_for_stream.clone();
             let tool_use_id = tool_use_id.clone();
             let tool_name = tool_name.clone();
-            let tool_input = tool_input.clone();
+            let tool_input_json = tool_input_json.clone();
             async move {
                 match phase {
                     0 => {
@@ -1303,7 +1304,7 @@ async fn v1_messages_handler(
                                 text: None,
                                 id: Some(tool_use_id),
                                 name: Some(tool_name),
-                                input: Some(tool_input),
+                                input: Some(json!({})),
                             },
                         };
                         let data = serde_json::to_string(&block_start).unwrap_or_default();
@@ -1311,15 +1312,28 @@ async fn v1_messages_handler(
                         Some((Ok::<_, Infallible>(event), 2))
                     }
                     2 => {
+                        let data = serde_json::to_string(&json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": tool_input_json,
+                            }
+                        }))
+                        .unwrap_or_default();
+                        let event = Event::default().event("content_block_delta").data(data);
+                        Some((Ok::<_, Infallible>(event), 3))
+                    }
+                    3 => {
                         let block_stop = ClaudeStreamContentBlockStop {
                             type_field: "content_block_stop",
                             index: 0,
                         };
                         let data = serde_json::to_string(&block_stop).unwrap_or_default();
                         let event = Event::default().event("content_block_stop").data(data);
-                        Some((Ok::<_, Infallible>(event), 3))
+                        Some((Ok::<_, Infallible>(event), 4))
                     }
-                    3 => {
+                    4 => {
                         let msg_delta = ClaudeStreamMessageDelta {
                             type_field: "message_delta",
                             delta: ClaudeStopDelta {
@@ -1332,9 +1346,9 @@ async fn v1_messages_handler(
                         };
                         let data = serde_json::to_string(&msg_delta).unwrap_or_default();
                         let event = Event::default().event("message_delta").data(data);
-                        Some((Ok::<_, Infallible>(event), 4))
+                        Some((Ok::<_, Infallible>(event), 5))
                     }
-                    4 => {
+                    5 => {
                         let stop = ClaudeStreamMessageStop {
                             type_field: "message_stop",
                         };

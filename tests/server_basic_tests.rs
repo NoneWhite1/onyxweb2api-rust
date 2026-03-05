@@ -741,8 +741,12 @@ async fn claude_messages_streaming_local_tool_use_returns_tool_use_events() {
     );
     assert!(sse.contains("\"name\":\"bash\""), "missing bash tool name: {sse}");
     assert!(
-        sse.contains("\"command\":\"pwd\""),
-        "missing tool input command: {sse}"
+        sse.contains("\"type\":\"input_json_delta\""),
+        "missing input_json_delta for tool input: {sse}"
+    );
+    assert!(
+        sse.contains("\\\"command\\\":\\\"pwd\\\""),
+        "missing tool input command in input_json_delta: {sse}"
     );
     assert!(
         sse.contains("\"stop_reason\":\"tool_use\""),
@@ -787,12 +791,16 @@ async fn claude_messages_streaming_write_tool_use_for_english_create_file_prompt
     );
     assert!(sse.contains("\"name\":\"write\""), "missing write tool name: {sse}");
     assert!(
-        sse.contains("\"filePath\":\"1234.txt\""),
-        "missing expected filePath in tool input: {sse}"
+        sse.contains("\"type\":\"input_json_delta\""),
+        "missing input_json_delta for write tool input: {sse}"
     );
     assert!(
-        sse.contains("\"content\":\"1234\""),
-        "missing expected content in tool input: {sse}"
+        sse.contains("\\\"filePath\\\":\\\"1234.txt\\\""),
+        "missing expected filePath in input_json_delta: {sse}"
+    );
+    assert!(
+        sse.contains("\\\"content\\\":\\\"1234\\\""),
+        "missing expected content in input_json_delta: {sse}"
     );
     assert!(
         sse.contains("\"stop_reason\":\"tool_use\""),
@@ -844,6 +852,59 @@ async fn claude_messages_streaming_prefers_write_when_bash_and_write_both_availa
     assert!(
         !sse.contains("\"name\":\"bash\""),
         "should not pick bash for this create-file prompt when write is available: {sse}"
+    );
+    assert!(
+        sse.contains("\"stop_reason\":\"tool_use\""),
+        "missing tool_use stop reason: {sse}"
+    );
+}
+
+#[tokio::test]
+async fn claude_messages_streaming_write_tool_use_emits_input_json_delta_for_chinese_prompt() {
+    let app = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"claude-opus-4.6",
+                        "messages":[{"role":"user","content":"帮我创建个文件名字为1234.txt写入1234内容。"}],
+                        "tools":[{"name":"write","description":"write file","input_schema":{"type":"object"}}],
+                        "max_tokens":1024,
+                        "stream":true
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), 65536).await.unwrap();
+    let sse = String::from_utf8_lossy(&body);
+
+    assert!(sse.contains("\"type\":\"tool_use\""), "missing tool_use block: {sse}");
+    assert!(sse.contains("\"name\":\"write\""), "missing write name: {sse}");
+    assert!(
+        sse.contains("\"type\":\"input_json_delta\""),
+        "missing input_json_delta event: {sse}"
+    );
+    assert!(
+        sse.contains("\"partial_json\":\"{\\\""),
+        "missing serialized partial_json payload in input_json_delta: {sse}"
+    );
+    assert!(
+        sse.contains("\\\"filePath\\\":\\\"1234.txt\\\""),
+        "missing filePath in input_json_delta payload: {sse}"
+    );
+    assert!(
+        sse.contains("\\\"content\\\":\\\"1234内容。\\\""),
+        "missing content in input_json_delta payload: {sse}"
     );
     assert!(
         sse.contains("\"stop_reason\":\"tool_use\""),
