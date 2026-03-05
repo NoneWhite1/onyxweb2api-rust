@@ -1849,11 +1849,19 @@ fn maybe_build_local_tool_call(tool_names: &[String], user_message: &str) -> Opt
     let path = extract_file_path_from_text(user_message)?;
     let content = extract_write_content_from_text(user_message)?;
 
+    if supports_write {
+        return Some(LocalToolCall {
+            name: "write".to_string(),
+            arguments: json!({"filePath": path, "content": content}).to_string(),
+        });
+    }
+
     if supports_bash {
         let parent = std::path::Path::new(&path)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
-            .filter(|p| !p.is_empty())?;
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| ".".to_string());
 
         let command = format!(
             "mkdir -p \"{}\" && printf %s \"{}\" > \"{}\"",
@@ -1864,13 +1872,6 @@ fn maybe_build_local_tool_call(tool_names: &[String], user_message: &str) -> Opt
         return Some(LocalToolCall {
             name: "bash".to_string(),
             arguments: json!({"command": command}).to_string(),
-        });
-    }
-
-    if supports_write {
-        return Some(LocalToolCall {
-            name: "write".to_string(),
-            arguments: json!({"filePath": path, "content": content}).to_string(),
         });
     }
 
@@ -1897,30 +1898,33 @@ fn extract_bash_command_from_text(input: &str) -> Option<String> {
 }
 
 fn extract_file_path_from_text(input: &str) -> Option<String> {
-    let start = input.find("/home/")?;
-    let mut candidate = String::new();
-    for ch in input[start..].chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-') {
-            candidate.push(ch);
-        } else {
-            break;
+    if let Some(start) = input.find("/home/") {
+        let mut candidate = String::new();
+        for ch in input[start..].chars() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-') {
+                candidate.push(ch);
+            } else {
+                break;
+            }
         }
+
+        if candidate.contains('.') && !candidate.ends_with('/') {
+            return Some(candidate);
+        }
+
+        let dir = if candidate.ends_with('/') {
+            candidate
+        } else if let Some(pos) = candidate.rfind('/') {
+            candidate[..=pos].to_string()
+        } else {
+            return None;
+        };
+
+        let filename = extract_filename_from_text(input)?;
+        return Some(format!("{dir}{filename}"));
     }
 
-    if candidate.contains('.') && !candidate.ends_with('/') {
-        return Some(candidate);
-    }
-
-    let dir = if candidate.ends_with('/') {
-        candidate
-    } else if let Some(pos) = candidate.rfind('/') {
-        candidate[..=pos].to_string()
-    } else {
-        return None;
-    };
-
-    let filename = extract_filename_from_text(input)?;
-    Some(format!("{dir}{filename}"))
+    extract_filename_from_text(input)
 }
 
 fn extract_filename_from_text(input: &str) -> Option<String> {
@@ -1943,14 +1947,31 @@ fn extract_filename_from_text(input: &str) -> Option<String> {
 }
 
 fn extract_write_content_from_text(input: &str) -> Option<String> {
-    let marker = "写入";
-    let start = input.find(marker)? + marker.len();
-    let content = input[start..].trim();
-    if content.is_empty() {
-        None
-    } else {
-        Some(content.trim_matches('"').to_string())
+    if let Some(start) = input.find("写入") {
+        let content = input[start + "写入".len()..].trim();
+        if !content.is_empty() {
+            return Some(content.trim_matches('"').trim_matches('\'').to_string());
+        }
     }
+
+    let lower = input.to_ascii_lowercase();
+    for marker in ["with content", "content"] {
+        if let Some(pos) = lower.find(marker) {
+            let raw = input[pos + marker.len()..].trim();
+            let cleaned = raw
+                .trim_start_matches([':', '：', '=', '-', ' '])
+                .trim_start_matches("is ")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim();
+            if !cleaned.is_empty() {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 fn escape_shell_double_quotes(input: &str) -> String {
@@ -2068,5 +2089,27 @@ mod tests {
         let tool_call = maybe_build_local_tool_call_from_claude_request(&req).expect("tool call expected");
         assert_eq!(tool_call.name, "bash");
         assert!(tool_call.arguments.contains("\"command\":\"pwd\""));
+    }
+
+    #[test]
+    fn claude_messages_english_create_file_prefers_write_tool_when_available() {
+        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "Please create 1234.txt with content 1234"}
+            ],
+            "tools": [
+                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}},
+                {"name": "write", "description": "write file", "input_schema": {"type": "object"}}
+            ],
+            "max_tokens": 1024,
+            "stream": false
+        }))
+        .expect("request should deserialize");
+
+        let tool_call = maybe_build_local_tool_call_from_claude_request(&req).expect("tool call expected");
+        assert_eq!(tool_call.name, "write");
+        assert!(tool_call.arguments.contains("\"filePath\":\"1234.txt\""));
+        assert!(tool_call.arguments.contains("\"content\":\"1234\""));
     }
 }

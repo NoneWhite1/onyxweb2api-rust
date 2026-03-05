@@ -750,3 +750,103 @@ async fn claude_messages_streaming_local_tool_use_returns_tool_use_events() {
     );
     assert!(sse.contains("event: message_stop"), "missing message_stop event: {sse}");
 }
+
+#[tokio::test]
+async fn claude_messages_streaming_write_tool_use_for_english_create_file_prompt() {
+    let app = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"claude-opus-4.6",
+                        "messages":[{"role":"user","content":"Please create 1234.txt with content 1234"}],
+                        "tools":[{"name":"write","description":"write file","input_schema":{"type":"object"}}],
+                        "max_tokens":1024,
+                        "stream":true
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), 65536).await.unwrap();
+    let sse = String::from_utf8_lossy(&body);
+
+    assert!(sse.contains("event: message_start"), "missing message_start event: {sse}");
+    assert!(
+        sse.contains("\"type\":\"tool_use\""),
+        "missing tool_use content block: {sse}"
+    );
+    assert!(sse.contains("\"name\":\"write\""), "missing write tool name: {sse}");
+    assert!(
+        sse.contains("\"filePath\":\"1234.txt\""),
+        "missing expected filePath in tool input: {sse}"
+    );
+    assert!(
+        sse.contains("\"content\":\"1234\""),
+        "missing expected content in tool input: {sse}"
+    );
+    assert!(
+        sse.contains("\"stop_reason\":\"tool_use\""),
+        "missing tool_use stop reason: {sse}"
+    );
+    assert!(sse.contains("event: message_stop"), "missing message_stop event: {sse}");
+}
+
+#[tokio::test]
+async fn claude_messages_streaming_prefers_write_when_bash_and_write_both_available() {
+    let app = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"claude-opus-4.6",
+                        "messages":[{"role":"user","content":"Please create 1234.txt with content 1234"}],
+                        "tools":[
+                            {"name":"bash","description":"run shell","input_schema":{"type":"object"}},
+                            {"name":"write","description":"write file","input_schema":{"type":"object"}}
+                        ],
+                        "max_tokens":1024,
+                        "stream":true
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), 65536).await.unwrap();
+    let sse = String::from_utf8_lossy(&body);
+
+    assert!(
+        sse.contains("\"type\":\"tool_use\""),
+        "missing tool_use content block: {sse}"
+    );
+    assert!(
+        sse.contains("\"name\":\"write\""),
+        "expected write tool when both write and bash available: {sse}"
+    );
+    assert!(
+        !sse.contains("\"name\":\"bash\""),
+        "should not pick bash for this create-file prompt when write is available: {sse}"
+    );
+    assert!(
+        sse.contains("\"stop_reason\":\"tool_use\""),
+        "missing tool_use stop reason: {sse}"
+    );
+}
