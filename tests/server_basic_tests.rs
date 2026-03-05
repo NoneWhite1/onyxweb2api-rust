@@ -704,3 +704,49 @@ async fn claude_messages_streaming() {
     assert_ne!(status, StatusCode::BAD_REQUEST);
     assert_ne!(status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn claude_messages_streaming_local_tool_use_returns_tool_use_events() {
+    let app = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"claude-opus-4.6",
+                        "messages":[{"role":"user","content":"Use the bash tool to run: pwd"}],
+                        "tools":[{"name":"bash","description":"run shell","input_schema":{"type":"object"}}],
+                        "max_tokens":1024,
+                        "stream":true
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), 65536).await.unwrap();
+    let sse = String::from_utf8_lossy(&body);
+
+    assert!(sse.contains("event: message_start"), "missing message_start event: {sse}");
+    assert!(
+        sse.contains("\"type\":\"tool_use\""),
+        "missing tool_use content block: {sse}"
+    );
+    assert!(sse.contains("\"name\":\"bash\""), "missing bash tool name: {sse}");
+    assert!(
+        sse.contains("\"command\":\"pwd\""),
+        "missing tool input command: {sse}"
+    );
+    assert!(
+        sse.contains("\"stop_reason\":\"tool_use\""),
+        "missing tool_use stop reason: {sse}"
+    );
+    assert!(sse.contains("event: message_stop"), "missing message_stop event: {sse}");
+}

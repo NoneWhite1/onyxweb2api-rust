@@ -183,6 +183,8 @@ pub struct AssistantToolCall {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub function: AssistantToolCallFunction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -224,6 +226,8 @@ pub struct ChunkDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<AssistantToolCall>>,
 }
 
 // ----- Anthropic Claude Messages API types -----

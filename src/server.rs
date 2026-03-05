@@ -585,6 +585,129 @@ async fn v1_chat_completions_handler(
     let requested_tool_names = req.requested_tool_names();
     let forced_tool_name = req.forced_tool_name();
 
+    if let Some(tool_call) = maybe_build_local_tool_call_from_chat_request(&req) {
+        if req.stream.unwrap_or(false) {
+            let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+            let created = now_ts();
+            let model = req.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+
+            let sse_stream = stream::unfold(0u8, move |phase| {
+                let chat_id = chat_id.clone();
+                let model = model.clone();
+                let tool_call_id = tool_call_id.clone();
+                let tool_name = tool_call.name.clone();
+                let tool_args = tool_call.arguments.clone();
+                async move {
+                    match phase {
+                        0 => {
+                            // Chunk 1: Role and initial tool call block
+                            let chunk = ChatCompletionChunk {
+                                id: chat_id,
+                                object: "chat.completion.chunk",
+                                created,
+                                model,
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChunkDelta {
+                                        role: Some("assistant"),
+                                        content: None,
+                                        reasoning_content: None,
+                                        tool_calls: Some(vec![AssistantToolCall {
+                                            id: tool_call_id,
+                                            kind: "function",
+                                            function: AssistantToolCallFunction {
+                                                name: tool_name,
+                                                arguments: String::new(),
+                                            },
+                                            index: Some(0),
+                                        }]),
+                                    },
+                                    finish_reason: None,
+                                }],
+                            };
+                            let event = Event::default().data(serde_json::to_string(&chunk).unwrap());
+                            Some((Ok::<_, Infallible>(event), 1))
+                        }
+                        1 => {
+                            // Chunk 2: Arguments delta
+                            let chunk = ChatCompletionChunk {
+                                id: chat_id,
+                                object: "chat.completion.chunk",
+                                created,
+                                model,
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChunkDelta {
+                                        role: None,
+                                        content: None,
+                                        reasoning_content: None,
+                                        tool_calls: Some(vec![AssistantToolCall {
+                                            id: String::new(), // ID only required in first chunk
+                                            kind: "function",
+                                            function: AssistantToolCallFunction {
+                                                name: String::new(),
+                                                arguments: tool_args,
+                                            },
+                                            index: Some(0),
+                                        }]),
+                                    },
+                                    finish_reason: None,
+                                }],
+                            };
+                            let event = Event::default().data(serde_json::to_string(&chunk).unwrap());
+                            Some((Ok::<_, Infallible>(event), 2))
+                        }
+                        2 => {
+                            // Chunk 3: Stop reason
+                            let chunk = ChatCompletionChunk {
+                                id: chat_id,
+                                object: "chat.completion.chunk",
+                                created,
+                                model,
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: ChunkDelta { role: None, content: None, reasoning_content: None, tool_calls: None },
+                                    finish_reason: Some("tool_calls"),
+                                }],
+                            };
+                            let event = Event::default().data(serde_json::to_string(&chunk).unwrap());
+                            Some((Ok::<_, Infallible>(event), 99))
+                        }
+                        _ => None,
+                    }
+                }
+            });
+            return Sse::new(sse_stream).into_response();
+        } else {
+            let response = ChatCompletionResponse {
+                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                object: "chat.completion",
+                created: now_ts(),
+                model: req.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                choices: vec![Choice {
+                    index: 0,
+                    message: AssistantMessage {
+                        role: "assistant",
+                        content: String::new(), // Should ideally be None, but kept for minimal change if Serialize allows empty string. Standard is null.
+                        reasoning_content: None,
+                        tool_calls: Some(vec![AssistantToolCall {
+                            id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                            kind: "function",
+                            function: AssistantToolCallFunction {
+                                name: tool_call.name,
+                                arguments: tool_call.arguments,
+                            },
+                            index: Some(0),
+                        }]),
+                    },
+                    finish_reason: "tool_calls",
+                }],
+            usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            };
+            return (StatusCode::OK, Json(json!(response))).into_response();
+        }
+        }
     if !req.stream.unwrap_or(false)
         && let Some(tool_call) = maybe_build_local_tool_call_from_chat_request(&req)
     {
@@ -606,6 +729,7 @@ async fn v1_chat_completions_handler(
                             name: tool_call.name,
                             arguments: tool_call.arguments,
                         },
+                        index: Some(0),
                     }]),
                 },
                 finish_reason: "tool_calls",
@@ -742,6 +866,7 @@ async fn v1_chat_completions_handler(
                                     role: Some("assistant"),
                                     content: None,
                                     reasoning_content: None,
+                                    tool_calls: None,
                                 },
                                 finish_reason: None,
                             }],
@@ -769,6 +894,7 @@ async fn v1_chat_completions_handler(
                                     role: None,
                                     content: None,
                                     reasoning_content: Some(text),
+                                    tool_calls: None,
                                 },
                                 finish_reason: None,
                             }],
@@ -789,6 +915,7 @@ async fn v1_chat_completions_handler(
                                     role: None,
                                     content: Some(text),
                                     reasoning_content: None,
+                                    tool_calls: None,
                                 },
                                 finish_reason: None,
                             }],
@@ -809,6 +936,7 @@ async fn v1_chat_completions_handler(
                                     role: None,
                                     content: None,
                                     reasoning_content: None,
+                                    tool_calls: None,
                                 },
                                 finish_reason: Some("stop"),
                             }],
@@ -1127,6 +1255,100 @@ async fn v1_messages_handler(
         }
         (chars / 4) as u32 + 10 // +10 for structural overhead
     };
+
+    if req.stream.unwrap_or(false)
+        && let Some(tool_call) = maybe_build_local_tool_call_from_claude_request(&req)
+    {
+        let tool_input: serde_json::Value =
+            serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
+        let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
+        let model_for_stream = model.clone();
+        let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
+        let tool_name = tool_call.name;
+
+        let sse_stream = stream::unfold(0u8, move |phase| {
+            let msg_id = msg_id.clone();
+            let model = model_for_stream.clone();
+            let tool_use_id = tool_use_id.clone();
+            let tool_name = tool_name.clone();
+            let tool_input = tool_input.clone();
+            async move {
+                match phase {
+                    0 => {
+                        let start = ClaudeStreamMessageStart {
+                            type_field: "message_start",
+                            message: ClaudeStreamMessageMeta {
+                                id: msg_id,
+                                type_field: "message",
+                                role: "assistant",
+                                content: vec![],
+                                model,
+                                stop_reason: None,
+                                usage: ClaudeUsage {
+                                    input_tokens,
+                                    output_tokens: 0,
+                                },
+                            },
+                        };
+                        let data = serde_json::to_string(&start).unwrap_or_default();
+                        let event = Event::default().event("message_start").data(data);
+                        Some((Ok::<_, Infallible>(event), 1))
+                    }
+                    1 => {
+                        let block_start = ClaudeStreamContentBlockStart {
+                            type_field: "content_block_start",
+                            index: 0,
+                            content_block: ClaudeContentBlock {
+                                type_field: "tool_use",
+                                text: None,
+                                id: Some(tool_use_id),
+                                name: Some(tool_name),
+                                input: Some(tool_input),
+                            },
+                        };
+                        let data = serde_json::to_string(&block_start).unwrap_or_default();
+                        let event = Event::default().event("content_block_start").data(data);
+                        Some((Ok::<_, Infallible>(event), 2))
+                    }
+                    2 => {
+                        let block_stop = ClaudeStreamContentBlockStop {
+                            type_field: "content_block_stop",
+                            index: 0,
+                        };
+                        let data = serde_json::to_string(&block_stop).unwrap_or_default();
+                        let event = Event::default().event("content_block_stop").data(data);
+                        Some((Ok::<_, Infallible>(event), 3))
+                    }
+                    3 => {
+                        let msg_delta = ClaudeStreamMessageDelta {
+                            type_field: "message_delta",
+                            delta: ClaudeStopDelta {
+                                stop_reason: "tool_use",
+                            },
+                            usage: ClaudeUsage {
+                                input_tokens,
+                                output_tokens: 0,
+                            },
+                        };
+                        let data = serde_json::to_string(&msg_delta).unwrap_or_default();
+                        let event = Event::default().event("message_delta").data(data);
+                        Some((Ok::<_, Infallible>(event), 4))
+                    }
+                    4 => {
+                        let stop = ClaudeStreamMessageStop {
+                            type_field: "message_stop",
+                        };
+                        let data = serde_json::to_string(&stop).unwrap_or_default();
+                        let event = Event::default().event("message_stop").data(data);
+                        Some((Ok::<_, Infallible>(event), 99))
+                    }
+                    _ => None,
+                }
+            }
+        });
+
+        return Sse::new(sse_stream).into_response();
+    }
 
     if !req.stream.unwrap_or(false)
         && let Some(tool_call) = maybe_build_local_tool_call_from_claude_request(&req)
@@ -1610,13 +1832,22 @@ fn maybe_build_local_tool_call_from_claude_request(
 }
 
 fn maybe_build_local_tool_call(tool_names: &[String], user_message: &str) -> Option<LocalToolCall> {
-    let path = extract_file_path_from_text(user_message)?;
-    let content = extract_write_content_from_text(user_message)?;
-
     let supports_bash = tool_names.iter().any(|name| name.eq_ignore_ascii_case("bash"));
     let supports_write = tool_names
         .iter()
         .any(|name| name.eq_ignore_ascii_case("write") || name.eq_ignore_ascii_case("write_file"));
+
+    if supports_bash
+        && let Some(command) = extract_bash_command_from_text(user_message)
+    {
+        return Some(LocalToolCall {
+            name: "bash".to_string(),
+            arguments: json!({"command": command}).to_string(),
+        });
+    }
+
+    let path = extract_file_path_from_text(user_message)?;
+    let content = extract_write_content_from_text(user_message)?;
 
     if supports_bash {
         let parent = std::path::Path::new(&path)
@@ -1641,6 +1872,25 @@ fn maybe_build_local_tool_call(tool_names: &[String], user_message: &str) -> Opt
             name: "write".to_string(),
             arguments: json!({"filePath": path, "content": content}).to_string(),
         });
+    }
+
+    None
+}
+
+fn extract_bash_command_from_text(input: &str) -> Option<String> {
+    for marker in ["run:", "run：", "command:", "command：", "cmd:", "cmd："] {
+        if let Some(pos) = input.to_ascii_lowercase().find(marker) {
+            let start = pos + marker.len();
+            let command = input[start..]
+                .trim()
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim();
+            if !command.is_empty() {
+                return Some(command.to_string());
+            }
+        }
     }
 
     None
@@ -1798,5 +2048,25 @@ mod tests {
         let tool_call = maybe_build_local_tool_call_from_claude_request(&req).expect("tool call expected");
         assert_eq!(tool_call.name, "bash");
         assert!(tool_call.arguments.contains("/home/nonewhite/Download/1234.txt"));
+    }
+
+    #[test]
+    fn claude_messages_single_bash_tool_request_generates_command_tool_call() {
+        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {"role": "user", "content": "Use the bash tool to run: pwd"}
+            ],
+            "tools": [
+                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}}
+            ],
+            "max_tokens": 1024,
+            "stream": false
+        }))
+        .expect("request should deserialize");
+
+        let tool_call = maybe_build_local_tool_call_from_claude_request(&req).expect("tool call expected");
+        assert_eq!(tool_call.name, "bash");
+        assert!(tool_call.arguments.contains("\"command\":\"pwd\""));
     }
 }
