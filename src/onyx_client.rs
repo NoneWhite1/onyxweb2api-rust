@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     config::Settings,
-    models::{ChatMessage, DEFAULT_MODEL},
+    models::{ChatMessage, ClaudeToolDefinition, DEFAULT_MODEL},
 };
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -541,6 +541,113 @@ pub fn build_prompt(messages: &[ChatMessage]) -> String {
         .join("\n")
 }
 
+// ----- Prompt-based tool calling emulation -----
+
+#[derive(Debug, Clone)]
+pub struct ParsedToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Build a prompt that includes tool definitions as text instructions.
+/// When tools are present, inject a system instruction telling the LLM
+/// to use `<tool_call>` markers for tool invocations.
+pub fn build_prompt_with_tools(
+    messages: &[ChatMessage],
+    tools: &[ClaudeToolDefinition],
+) -> String {
+    let mut parts = Vec::new();
+
+    // Inject tool definitions as a system instruction
+    if !tools.is_empty() {
+        let mut tool_section = String::from(
+            "system: You have access to the following tools. When you need to use a tool, you MUST respond with a tool call in this EXACT format (including the XML tags):\n\n\
+             <tool_call>\n\
+             {\"name\": \"tool_name\", \"arguments\": {\"param1\": \"value1\"}}\n\
+             </tool_call>\n\n\
+             You can make multiple tool calls by using multiple <tool_call> blocks.\n\
+             If you don't need to use any tool, respond normally with text.\n\
+             IMPORTANT: Always use the <tool_call> tags, never call tools in any other format.\n\n\
+             Available tools:\n",
+        );
+
+        for tool in tools {
+            tool_section.push_str(&format!("- {}", tool.name));
+            if let Some(desc) = &tool.description {
+                tool_section.push_str(&format!(": {}", desc));
+            }
+            tool_section.push('\n');
+            if let Some(schema) = &tool.input_schema {
+                tool_section.push_str(&format!("  Parameters: {}\n", schema));
+            }
+        }
+
+        parts.push(tool_section);
+    }
+
+    // Format messages, handling tool results specially
+    for m in messages {
+        let content = m.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        parts.push(format!("{}: {}", m.role, content));
+    }
+
+    parts.join("\n")
+}
+
+/// Extract tool calls from LLM response text that uses `<tool_call>` markers.
+/// Returns a list of parsed tool calls and the remaining text with markers removed.
+pub fn extract_tool_calls_from_text(text: &str) -> (Vec<ParsedToolCall>, String) {
+    let mut tool_calls = Vec::new();
+    let mut remaining = String::new();
+    let mut search_from = 0;
+
+    while search_from < text.len() {
+        let rest = &text[search_from..];
+        if let Some(start_pos) = rest.find("<tool_call>") {
+            // Add text before the marker to remaining
+            remaining.push_str(&rest[..start_pos]);
+
+            let after_tag = &rest[start_pos + "<tool_call>".len()..];
+            if let Some(end_pos) = after_tag.find("</tool_call>") {
+                let json_str = after_tag[..end_pos].trim();
+                if let Some(tc) = parse_tool_call_json(json_str) {
+                    tool_calls.push(tc);
+                } else {
+                    // Failed to parse — keep original text
+                    remaining.push_str(&rest[start_pos..start_pos + "<tool_call>".len() + end_pos + "</tool_call>".len()]);
+                }
+                search_from += start_pos + "<tool_call>".len() + end_pos + "</tool_call>".len();
+            } else {
+                // No closing tag — keep as-is
+                remaining.push_str(&rest[start_pos..]);
+                search_from = text.len();
+            }
+        } else {
+            remaining.push_str(rest);
+            break;
+        }
+    }
+
+    let remaining = remaining.trim().to_string();
+    (tool_calls, remaining)
+}
+
+fn parse_tool_call_json(json_str: &str) -> Option<ParsedToolCall> {
+    let v: Value = serde_json::from_str(json_str).ok()?;
+    let name = v.get("name")?.as_str()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let arguments = v
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some(ParsedToolCall { name, arguments })
+}
+
 fn resolve_model(model_name: &str) -> (String, String) {
     match model_name {
         "claude-opus-4.6" => ("Anthropic".to_string(), "claude-opus-4-6".to_string()),
@@ -724,5 +831,66 @@ data: [DONE]"#;
     fn retry_trigger_ignores_non_syntaxerror_content() {
         let msg = "Python tool completed successfully.";
         assert!(!super::should_retry_python_syntax_error(msg));
+    }
+
+    #[test]
+    fn extract_tool_calls_parses_single_tool_call() {
+        let text = "Let me check that for you.\n\n<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}\n</tool_call>";
+        let (calls, remaining) = super::extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments, json!({"command": "ls -la"}));
+        assert_eq!(remaining, "Let me check that for you.");
+    }
+
+    #[test]
+    fn extract_tool_calls_parses_multiple_tool_calls() {
+        let text = "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call>\n\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"TODO\", \"path\": \".\"}}\n</tool_call>";
+        let (calls, remaining) = super::extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[1].name, "grep");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn extract_tool_calls_returns_empty_for_plain_text() {
+        let text = "Here is your answer: the file contains 42 lines.";
+        let (calls, remaining) = super::extract_tool_calls_from_text(text);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, text);
+    }
+
+    #[test]
+    fn extract_tool_calls_handles_malformed_json() {
+        let text = "<tool_call>\nnot valid json\n</tool_call>";
+        let (calls, remaining) = super::extract_tool_calls_from_text(text);
+        assert!(calls.is_empty());
+        // malformed content is kept as-is
+        assert!(!remaining.is_empty());
+    }
+
+    #[test]
+    fn build_prompt_with_tools_injects_definitions() {
+        use crate::models::ClaudeToolDefinition;
+
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "list files".to_string(),
+            },
+        ];
+        let tools = vec![
+            ClaudeToolDefinition {
+                name: "bash".to_string(),
+                description: Some("Execute shell commands".to_string()),
+                input_schema: Some(json!({"type": "object", "properties": {"command": {"type": "string"}}})),
+            },
+        ];
+        let prompt = super::build_prompt_with_tools(&messages, &tools);
+        assert!(prompt.contains("<tool_call>"), "should contain tool_call instruction");
+        assert!(prompt.contains("bash"), "should contain tool name");
+        assert!(prompt.contains("Execute shell commands"), "should contain description");
+        assert!(prompt.contains("user: list files"), "should contain user message");
     }
 }

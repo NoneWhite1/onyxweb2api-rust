@@ -1236,6 +1236,18 @@ async fn v1_messages_handler(
             content: sys.clone(),
         });
     }
+
+    // When tools are present, inject tool definitions as a system instruction
+    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    if has_tools {
+        let tools = req.tools.as_ref().unwrap();
+        let tool_instruction = build_tool_injection_prompt(tools);
+        chat_messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: tool_instruction,
+        });
+    }
+
     for m in &req.messages {
         chat_messages.push(ChatMessage {
             role: m.role.clone(),
@@ -1405,6 +1417,15 @@ async fn v1_messages_handler(
 
     // ----- Streaming mode -----
     if req.stream.unwrap_or(false) {
+        // When tools are present, use full_chat + post-process to detect tool_calls.
+        // This sacrifices streaming latency but ensures reliable tool_call detection.
+        if has_tools {
+            return claude_stream_with_tools(
+                &state, &cookie_values, &chat_messages, &model,
+                &requested_tool_names, forced_tool_name.as_deref(), input_tokens,
+            ).await;
+        }
+
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
         let model_for_stream = model.clone();
 
@@ -1651,6 +1672,50 @@ async fn v1_messages_handler(
                 cm.mark_call_success(cookie);
                 cm.save();
 
+                // Check for tool_calls in the response text
+                let (tool_calls, remaining_text) = if has_tools {
+                    onyx_client::extract_tool_calls_from_text(&content)
+                } else {
+                    (vec![], content.clone())
+                };
+
+                if !tool_calls.is_empty() {
+                    // Build content blocks: optional text block + tool_use blocks
+                    let mut blocks = Vec::new();
+                    if !remaining_text.is_empty() {
+                        blocks.push(ClaudeContentBlock {
+                            type_field: "text",
+                            text: Some(remaining_text),
+                            id: None,
+                            name: None,
+                            input: None,
+                        });
+                    }
+                    for tc in &tool_calls {
+                        blocks.push(ClaudeContentBlock {
+                            type_field: "tool_use",
+                            text: None,
+                            id: Some(format!("toolu_{}", uuid::Uuid::new_v4().simple())),
+                            name: Some(tc.name.clone()),
+                            input: Some(tc.arguments.clone()),
+                        });
+                    }
+
+                    let response = ClaudeMessagesResponse {
+                        id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
+                        type_field: "message",
+                        role: "assistant",
+                        content: blocks,
+                        model: model.clone(),
+                        stop_reason: "tool_use",
+                        usage: ClaudeUsage {
+                            input_tokens,
+                            output_tokens: 0,
+                        },
+                    };
+                    return (StatusCode::OK, Json(json!(response))).into_response();
+                }
+
                 let response = ClaudeMessagesResponse {
                     id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
                     type_field: "message",
@@ -1695,6 +1760,389 @@ async fn v1_messages_handler(
         Json(json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}})),
     )
         .into_response()
+}
+
+/// Build a system prompt that instructs the LLM to use `<tool_call>` markers.
+fn build_tool_injection_prompt(tools: &[crate::models::ClaudeToolDefinition]) -> String {
+    let mut s = String::from(
+        "You have access to the following tools. When you need to use a tool, you MUST respond with a tool call in this EXACT format (including the XML tags):\n\n\
+         <tool_call>\n\
+         {\"name\": \"tool_name\", \"arguments\": {\"param1\": \"value1\"}}\n\
+         </tool_call>\n\n\
+         You can make multiple tool calls by using multiple <tool_call> blocks.\n\
+         If you don't need to use any tool, respond normally with text.\n\
+         IMPORTANT: Always use the <tool_call> tags, never call tools in any other format.\n\n\
+         Available tools:\n",
+    );
+
+    for tool in tools {
+        s.push_str(&format!("- {}", tool.name));
+        if let Some(desc) = &tool.description {
+            s.push_str(&format!(": {}", desc));
+        }
+        s.push('\n');
+        if let Some(schema) = &tool.input_schema {
+            s.push_str(&format!("  Parameters: {}\n", schema));
+        }
+    }
+
+    s
+}
+
+/// Handle Claude streaming requests when tools are present.
+/// Collects the full response via `full_chat()`, parses tool_calls,
+/// then emits SSE events in the correct Claude streaming format.
+async fn claude_stream_with_tools(
+    state: &AppState,
+    cookie_values: &[String],
+    chat_messages: &[ChatMessage],
+    model: &str,
+    requested_tool_names: &[String],
+    forced_tool_name: Option<&str>,
+    input_tokens: u32,
+) -> axum::response::Response {
+    let mut last_err = String::from("unknown upstream error");
+
+    for cookie in cookie_values {
+        let (allowed_tool_ids, forced_tool_id) =
+            match resolve_tool_selection_for_cookie(
+                &state.http_client,
+                &state.settings,
+                cookie,
+                requested_tool_names,
+                forced_tool_name,
+            )
+            .await
+            {
+                Ok(selection) => selection,
+                Err(err) => {
+                    let err_msg = onyx_client::format_error_chain(&err);
+                    let cookie_fp = crate::cookie_manager::fingerprint(cookie);
+                    error!(
+                        endpoint = "/v1/messages",
+                        mode = "stream+tools",
+                        cookie = %cookie_fp,
+                        error = %err_msg,
+                        "tool translation failed"
+                    );
+                    let mut cm = state.cookie_manager.write().await;
+                    mark_cookie_failure(&mut cm, cookie, err_msg.clone());
+                    cm.save();
+                    last_err = err_msg;
+                    continue;
+                }
+            };
+
+        match onyx_client::full_chat(
+            &state.http_client,
+            &state.settings,
+            cookie,
+            chat_messages,
+            model,
+            allowed_tool_ids.as_deref(),
+            forced_tool_id,
+        )
+        .await
+        {
+            Ok((content, _thinking)) => {
+                let mut cm = state.cookie_manager.write().await;
+                cm.mark_call_success(cookie);
+                cm.save();
+
+                let (tool_calls, remaining_text) =
+                    onyx_client::extract_tool_calls_from_text(&content);
+
+                let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
+                let model_owned = model.to_string();
+
+                if !tool_calls.is_empty() {
+                    return emit_claude_tool_use_sse_stream(
+                        msg_id,
+                        model_owned,
+                        input_tokens,
+                        remaining_text,
+                        tool_calls,
+                    );
+                }
+
+                // No tool_calls detected — emit as normal text stream
+                return emit_claude_text_sse_stream(
+                    msg_id,
+                    model_owned,
+                    input_tokens,
+                    content,
+                );
+            }
+            Err(err) => {
+                let err_msg = onyx_client::format_error_chain(&err);
+                let cookie_fp = crate::cookie_manager::fingerprint(cookie);
+                error!(
+                    endpoint = "/v1/messages",
+                    mode = "stream+tools",
+                    cookie = %cookie_fp,
+                    error = %err_msg,
+                    "claude stream+tools upstream failed"
+                );
+                let mut cm = state.cookie_manager.write().await;
+                mark_cookie_failure(&mut cm, cookie, err_msg.clone());
+                cm.save();
+                last_err = err_msg;
+            }
+        }
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}})),
+    )
+        .into_response()
+}
+
+/// Emit a Claude SSE stream with tool_use content blocks.
+fn emit_claude_tool_use_sse_stream(
+    msg_id: String,
+    model: String,
+    input_tokens: u32,
+    remaining_text: String,
+    tool_calls: Vec<onyx_client::ParsedToolCall>,
+) -> axum::response::Response {
+    // Pre-build all SSE events as a Vec, then stream them in order.
+    let mut events: Vec<Event> = Vec::new();
+
+    // 1) message_start
+    let start = ClaudeStreamMessageStart {
+        type_field: "message_start",
+        message: ClaudeStreamMessageMeta {
+            id: msg_id,
+            type_field: "message",
+            role: "assistant",
+            content: vec![],
+            model,
+            stop_reason: None,
+            usage: ClaudeUsage {
+                input_tokens,
+                output_tokens: 0,
+            },
+        },
+    };
+    events.push(Event::default().event("message_start").data(
+        serde_json::to_string(&start).unwrap_or_default(),
+    ));
+
+    let mut block_index: u8 = 0;
+
+    // 2) Optional text block if there's remaining text
+    if !remaining_text.is_empty() {
+        events.push(
+            Event::default().event("content_block_start").data(
+                serde_json::to_string(&ClaudeStreamContentBlockStart {
+                    type_field: "content_block_start",
+                    index: block_index,
+                    content_block: ClaudeContentBlock {
+                        type_field: "text",
+                        text: Some(String::new()),
+                        id: None,
+                        name: None,
+                        input: None,
+                    },
+                })
+                .unwrap_or_default(),
+            ),
+        );
+        events.push(
+            Event::default().event("content_block_delta").data(
+                serde_json::to_string(&ClaudeStreamContentBlockDelta {
+                    type_field: "content_block_delta",
+                    index: block_index,
+                    delta: ClaudeTextDelta {
+                        type_field: "text_delta",
+                        text: remaining_text,
+                    },
+                })
+                .unwrap_or_default(),
+            ),
+        );
+        events.push(
+            Event::default().event("content_block_stop").data(
+                serde_json::to_string(&ClaudeStreamContentBlockStop {
+                    type_field: "content_block_stop",
+                    index: block_index,
+                })
+                .unwrap_or_default(),
+            ),
+        );
+        block_index += 1;
+    }
+
+    // 3) tool_use blocks
+    for tc in &tool_calls {
+        let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
+        let tool_input_json = serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string());
+
+        events.push(
+            Event::default().event("content_block_start").data(
+                serde_json::to_string(&ClaudeStreamContentBlockStart {
+                    type_field: "content_block_start",
+                    index: block_index,
+                    content_block: ClaudeContentBlock {
+                        type_field: "tool_use",
+                        text: None,
+                        id: Some(tool_use_id),
+                        name: Some(tc.name.clone()),
+                        input: Some(json!({})),
+                    },
+                })
+                .unwrap_or_default(),
+            ),
+        );
+        events.push(
+            Event::default().event("content_block_delta").data(
+                serde_json::to_string(&json!({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": tool_input_json,
+                    }
+                }))
+                .unwrap_or_default(),
+            ),
+        );
+        events.push(
+            Event::default().event("content_block_stop").data(
+                serde_json::to_string(&ClaudeStreamContentBlockStop {
+                    type_field: "content_block_stop",
+                    index: block_index,
+                })
+                .unwrap_or_default(),
+            ),
+        );
+        block_index += 1;
+    }
+
+    // 4) message_delta with stop_reason=tool_use
+    events.push(
+        Event::default().event("message_delta").data(
+            serde_json::to_string(&ClaudeStreamMessageDelta {
+                type_field: "message_delta",
+                delta: ClaudeStopDelta {
+                    stop_reason: "tool_use",
+                },
+                usage: ClaudeUsage {
+                    input_tokens,
+                    output_tokens: 0,
+                },
+            })
+            .unwrap_or_default(),
+        ),
+    );
+
+    // 5) message_stop
+    events.push(
+        Event::default().event("message_stop").data(
+            serde_json::to_string(&ClaudeStreamMessageStop {
+                type_field: "message_stop",
+            })
+            .unwrap_or_default(),
+        ),
+    );
+
+    let sse_stream = stream::unfold(events.into_iter(), |mut iter| async move {
+        iter.next().map(|event| (Ok::<_, Infallible>(event), iter))
+    });
+
+    Sse::new(sse_stream).into_response()
+}
+
+/// Emit a Claude SSE stream with plain text content (no tool_calls).
+fn emit_claude_text_sse_stream(
+    msg_id: String,
+    model: String,
+    input_tokens: u32,
+    content: String,
+) -> axum::response::Response {
+    let mut events: Vec<Event> = Vec::new();
+
+    events.push(Event::default().event("message_start").data(
+        serde_json::to_string(&ClaudeStreamMessageStart {
+            type_field: "message_start",
+            message: ClaudeStreamMessageMeta {
+                id: msg_id,
+                type_field: "message",
+                role: "assistant",
+                content: vec![],
+                model,
+                stop_reason: None,
+                usage: ClaudeUsage {
+                    input_tokens,
+                    output_tokens: 0,
+                },
+            },
+        })
+        .unwrap_or_default(),
+    ));
+
+    events.push(Event::default().event("content_block_start").data(
+        serde_json::to_string(&ClaudeStreamContentBlockStart {
+            type_field: "content_block_start",
+            index: 0,
+            content_block: ClaudeContentBlock {
+                type_field: "text",
+                text: Some(String::new()),
+                id: None,
+                name: None,
+                input: None,
+            },
+        })
+        .unwrap_or_default(),
+    ));
+
+    events.push(Event::default().event("content_block_delta").data(
+        serde_json::to_string(&ClaudeStreamContentBlockDelta {
+            type_field: "content_block_delta",
+            index: 0,
+            delta: ClaudeTextDelta {
+                type_field: "text_delta",
+                text: content,
+            },
+        })
+        .unwrap_or_default(),
+    ));
+
+    events.push(Event::default().event("content_block_stop").data(
+        serde_json::to_string(&ClaudeStreamContentBlockStop {
+            type_field: "content_block_stop",
+            index: 0,
+        })
+        .unwrap_or_default(),
+    ));
+
+    events.push(Event::default().event("message_delta").data(
+        serde_json::to_string(&ClaudeStreamMessageDelta {
+            type_field: "message_delta",
+            delta: ClaudeStopDelta {
+                stop_reason: "end_turn",
+            },
+            usage: ClaudeUsage {
+                input_tokens,
+                output_tokens: 0,
+            },
+        })
+        .unwrap_or_default(),
+    ));
+
+    events.push(Event::default().event("message_stop").data(
+        serde_json::to_string(&ClaudeStreamMessageStop {
+            type_field: "message_stop",
+        })
+        .unwrap_or_default(),
+    ));
+
+    let sse_stream = stream::unfold(events.into_iter(), |mut iter| async move {
+        iter.next().map(|event| (Ok::<_, Infallible>(event), iter))
+    });
+
+    Sse::new(sse_stream).into_response()
 }
 
 async fn resolve_tool_selection_for_cookie(
