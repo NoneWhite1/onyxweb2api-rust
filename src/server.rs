@@ -2198,6 +2198,9 @@ fn classify_cookie_failure(reason: &str) -> CookieFailureKind {
         "insufficient_quota",
         "quota exceeded",
         "quota exhausted",
+        "usage limit exceeded",
+        "usagelimitexceedederror",
+        "llm_cost_cents",
         "credit balance",
         "额度耗尽",
     ];
@@ -2469,6 +2472,18 @@ mod tests {
     #[test]
     fn classify_cookie_failure_marks_rate_limit_as_permanent() {
         let reason = "onyx send-chat-message HTTP 429: rate limit exceeded";
+        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Permanent);
+    }
+
+    #[test]
+    fn classify_cookie_failure_marks_usage_limit_exceeded_as_permanent() {
+        let reason = "empty upstream response: {\"error\":\"An unexpected error occurred while processing your request. Please try again later.\",\"stack_trace\":\"Traceback ... UsageLimitExceededError: Usage limit exceeded for llm_cost_cents: current usage 847.9482500000003, limit 800.0\"}";
+        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Permanent);
+    }
+
+    #[test]
+    fn classify_cookie_failure_marks_llm_cost_cents_limit_exceeded_as_permanent() {
+        let reason = "empty upstream response: UsageLimitExceededError: Usage limit exceeded for llm_cost_cents";
         assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Permanent);
     }
 
