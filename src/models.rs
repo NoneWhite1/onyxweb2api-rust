@@ -15,13 +15,13 @@ pub fn supported_models() -> Vec<&'static str> {
     ]
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     pub model: Option<String>,
@@ -75,7 +75,7 @@ impl ChatCompletionRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAIToolDefinition {
     #[serde(default)]
     pub r#type: Option<String>,
@@ -85,7 +85,7 @@ pub struct OpenAIToolDefinition {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAIFunctionDefinition {
     pub name: String,
     #[serde(default)]
@@ -94,14 +94,14 @@ pub struct OpenAIFunctionDefinition {
     pub parameters: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum OpenAIToolChoice {
     String(String),
     Object(OpenAIToolChoiceObject),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAIToolChoiceObject {
     #[serde(default)]
     pub r#type: Option<String>,
@@ -111,7 +111,7 @@ pub struct OpenAIToolChoiceObject {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAIFunctionChoice {
     pub name: String,
 }
@@ -232,7 +232,7 @@ pub struct ChunkDelta {
 
 // ----- Anthropic Claude Messages API types -----
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClaudeMessagesRequest {
     pub model: String,
     pub messages: Vec<ClaudeMessage>,
@@ -296,7 +296,7 @@ impl ClaudeMessagesRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClaudeToolDefinition {
     pub name: String,
     #[serde(default)]
@@ -305,14 +305,14 @@ pub struct ClaudeToolDefinition {
     pub input_schema: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ClaudeToolChoice {
     String(String),
     Object(ClaudeToolChoiceObject),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClaudeToolChoiceObject {
     #[serde(default, rename = "type")]
     pub type_field: Option<String>,
@@ -347,10 +347,11 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClaudeMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing)]
     pub has_tool_result: bool,
 }
 

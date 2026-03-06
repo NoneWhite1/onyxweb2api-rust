@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::error::Error as StdError;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +16,7 @@ use futures_util::stream;
 use reqwest::header::SET_COOKIE;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tracing::error;
 
@@ -74,6 +76,15 @@ struct LoginRequest {
 #[derive(Debug, Serialize)]
 struct MutationResponse {
     ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ProxyAuditRecord {
+    ts_ms: u64,
+    endpoint: String,
+    status: u16,
+    request: serde_json::Value,
+    response: serde_json::Value,
 }
 
 pub fn build_state(settings: Settings) -> anyhow::Result<AppState> {
@@ -617,6 +628,8 @@ async fn v1_chat_completions_handler(
             .into_response();
     }
 
+    let request_log = serde_json::to_value(&req).unwrap_or_else(|_| json!({"error":"request_serialize_failed"}));
+
     let requested_tool_names = req.requested_tool_names();
     let forced_tool_name = req.forced_tool_name();
 
@@ -738,9 +751,18 @@ async fn v1_chat_completions_handler(
                     },
                     finish_reason: "tool_calls",
                 }],
-            usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
             };
-            return (StatusCode::OK, Json(json!(response))).into_response();
+            let response_json = json!(response);
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/chat/completions",
+                &request_log,
+                StatusCode::OK,
+                &response_json,
+            )
+            .await;
+            return (StatusCode::OK, Json(response_json)).into_response();
         }
         }
     if !req.stream.unwrap_or(false)
@@ -776,7 +798,17 @@ async fn v1_chat_completions_handler(
             },
         };
 
-        return (StatusCode::OK, Json(json!(response))).into_response();
+        let response_json = json!(response);
+        append_proxy_audit_record(
+            &state.settings,
+            "/v1/chat/completions",
+            &request_log,
+            StatusCode::OK,
+            &response_json,
+        )
+        .await;
+
+        return (StatusCode::OK, Json(response_json)).into_response();
     }
 
     if req.stream.unwrap_or(false) {
@@ -786,9 +818,18 @@ async fn v1_chat_completions_handler(
         let cookie_values = active_cookie_values_round_robin(&state).await;
 
         if cookie_values.is_empty() {
+            let response_json = json!({"error":"no cookies configured"});
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/chat/completions",
+                &request_log,
+                StatusCode::BAD_GATEWAY,
+                &response_json,
+            )
+            .await;
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error":"no cookies configured"})),
+                Json(response_json),
             )
                 .into_response();
         }
@@ -870,12 +911,30 @@ async fn v1_chat_completions_handler(
         }
 
         let Some(rx) = rx_opt else {
+            let response_json = json!({"error": format!("upstream failure: {last_err}")});
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/chat/completions",
+                &request_log,
+                StatusCode::BAD_GATEWAY,
+                &response_json,
+            )
+            .await;
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("upstream failure: {last_err}")})),
+                Json(response_json),
             )
                 .into_response();
         };
+
+        append_proxy_audit_record(
+            &state.settings,
+            "/v1/chat/completions",
+            &request_log,
+            StatusCode::OK,
+            &json!({"stream":true,"status":"started"}),
+        )
+        .await;
 
         // Build SSE stream from the mpsc receiver
         let sse_stream = stream::unfold(
@@ -1067,8 +1126,17 @@ async fn v1_chat_completions_handler(
                         total_tokens: 0,
                     },
                 };
+                let response_json = json!(response);
+                append_proxy_audit_record(
+                    &state.settings,
+                    "/v1/chat/completions",
+                    &request_log,
+                    StatusCode::OK,
+                    &response_json,
+                )
+                .await;
 
-                return (StatusCode::OK, Json(json!(response))).into_response();
+                return (StatusCode::OK, Json(response_json)).into_response();
             }
             Err(err) => {
                 let err_msg = onyx_client::format_error_chain(&err);
@@ -1088,9 +1156,18 @@ async fn v1_chat_completions_handler(
         }
     }
 
+    let response_json = json!({"error": format!("upstream failure: {last_err}")});
+    append_proxy_audit_record(
+        &state.settings,
+        "/v1/chat/completions",
+        &request_log,
+        StatusCode::BAD_GATEWAY,
+        &response_json,
+    )
+    .await;
     (
         StatusCode::BAD_GATEWAY,
-        Json(json!({"error": format!("upstream failure: {last_err}")})),
+        Json(response_json),
     )
         .into_response()
 }
@@ -1256,6 +1333,8 @@ async fn v1_messages_handler(
         )
             .into_response();
     }
+
+    let request_log = serde_json::to_value(&req).unwrap_or_else(|_| json!({"error":"request_serialize_failed"}));
 
     // Convert Claude messages to our internal ChatMessage format
     let mut chat_messages: Vec<ChatMessage> = Vec::new();
@@ -1428,15 +1507,33 @@ async fn v1_messages_handler(
                 output_tokens: 0,
             },
         };
-        return (StatusCode::OK, Json(json!(response))).into_response();
+        let response_json = json!(response);
+        append_proxy_audit_record(
+            &state.settings,
+            "/v1/messages",
+            &request_log,
+            StatusCode::OK,
+            &response_json,
+        )
+        .await;
+        return (StatusCode::OK, Json(response_json)).into_response();
     }
 
     let cookie_values = active_cookie_values_round_robin(&state).await;
 
     if cookie_values.is_empty() {
+        let response_json = json!({"type":"error","error":{"type":"api_error","message":"no cookies configured"}});
+        append_proxy_audit_record(
+            &state.settings,
+            "/v1/messages",
+            &request_log,
+            StatusCode::BAD_GATEWAY,
+            &response_json,
+        )
+        .await;
         return (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"type":"error","error":{"type":"api_error","message":"no cookies configured"}})),
+            Json(response_json),
         )
             .into_response();
     }
@@ -1446,6 +1543,14 @@ async fn v1_messages_handler(
         // When tools are present, use full_chat + post-process to detect tool_calls.
         // This sacrifices streaming latency but ensures reliable tool_call detection.
         if has_tools {
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/messages",
+                &request_log,
+                StatusCode::OK,
+                &json!({"stream":true,"status":"started","mode":"tool-aware"}),
+            )
+            .await;
             return claude_stream_with_tools(
                 &state, &cookie_values, &chat_messages, &model,
                 &requested_tool_names, forced_tool_name.as_deref(), input_tokens,
@@ -1525,12 +1630,30 @@ async fn v1_messages_handler(
         }
 
         let Some(rx) = rx_opt else {
+            let response_json = json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}});
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/messages",
+                &request_log,
+                StatusCode::BAD_GATEWAY,
+                &response_json,
+            )
+            .await;
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}})),
+                Json(response_json),
             )
                 .into_response();
         };
+
+        append_proxy_audit_record(
+            &state.settings,
+            "/v1/messages",
+            &request_log,
+            StatusCode::OK,
+            &json!({"stream":true,"status":"started"}),
+        )
+        .await;
 
         // Build SSE stream for Claude format
         // State: (rx, msg_id, model, phase, output_tokens, input_tokens, buffer)
@@ -1727,7 +1850,7 @@ async fn v1_messages_handler(
                         });
                     }
 
-                    let response = ClaudeMessagesResponse {
+        let response = ClaudeMessagesResponse {
                         id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
                         type_field: "message",
                         role: "assistant",
@@ -1739,7 +1862,16 @@ async fn v1_messages_handler(
                             output_tokens: 0,
                         },
                     };
-                    return (StatusCode::OK, Json(json!(response))).into_response();
+                    let response_json = json!(response);
+                    append_proxy_audit_record(
+                        &state.settings,
+                        "/v1/messages",
+                        &request_log,
+                        StatusCode::OK,
+                        &response_json,
+                    )
+                    .await;
+                    return (StatusCode::OK, Json(response_json)).into_response();
                 }
 
                 let response = ClaudeMessagesResponse {
@@ -1760,8 +1892,17 @@ async fn v1_messages_handler(
                         output_tokens: 0,
                     },
                 };
+                let response_json = json!(response);
+                append_proxy_audit_record(
+                    &state.settings,
+                    "/v1/messages",
+                    &request_log,
+                    StatusCode::OK,
+                    &response_json,
+                )
+                .await;
 
-                return (StatusCode::OK, Json(json!(response))).into_response();
+                return (StatusCode::OK, Json(response_json)).into_response();
             }
             Err(err) => {
                 let err_msg = onyx_client::format_error_chain(&err);
@@ -1781,9 +1922,18 @@ async fn v1_messages_handler(
         }
     }
 
+    let response_json = json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}});
+    append_proxy_audit_record(
+        &state.settings,
+        "/v1/messages",
+        &request_log,
+        StatusCode::BAD_GATEWAY,
+        &response_json,
+    )
+    .await;
     (
         StatusCode::BAD_GATEWAY,
-        Json(json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}})),
+        Json(response_json),
     )
         .into_response()
 }
@@ -2478,6 +2628,67 @@ fn now_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn append_proxy_audit_record(
+    settings: &Settings,
+    endpoint: &str,
+    request: &serde_json::Value,
+    status: StatusCode,
+    response: &serde_json::Value,
+) {
+    let path_value = settings.request_audit_log_path.trim();
+    if path_value.is_empty() {
+        return;
+    }
+
+    let path = FsPath::new(path_value);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        error!(log_path = %path.display(), error = %err, "failed to create proxy audit log directory");
+        return;
+    }
+
+    let record = ProxyAuditRecord {
+        ts_ms: now_unix_ms(),
+        endpoint: endpoint.to_string(),
+        status: status.as_u16(),
+        request: request.clone(),
+        response: response.clone(),
+    };
+
+    let serialized = match serde_json::to_string(&record) {
+        Ok(v) => v,
+        Err(err) => {
+            error!(log_path = %path.display(), error = %err, "failed to serialize proxy audit log");
+            return;
+        }
+    };
+
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        Ok(mut file) => {
+            if let Err(err) = file.write_all(format!("{serialized}\n").as_bytes()).await {
+                error!(log_path = %path.display(), error = %err, "failed to append proxy audit log");
+            }
+        }
+        Err(err) => {
+            error!(log_path = %path.display(), error = %err, "failed to open proxy audit log file");
+        }
+    }
 }
 
 #[cfg(test)]
