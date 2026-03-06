@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
+    body::Bytes,
     Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{Html, IntoResponse, Sse, sse::Event},
     routing::{delete, get, post},
@@ -83,6 +84,7 @@ struct ProxyAuditRecord {
     ts_ms: u64,
     endpoint: String,
     status: u16,
+    raw_request_body: Option<String>,
     request: serde_json::Value,
     response: serde_json::Value,
 }
@@ -614,11 +616,23 @@ async fn v1_models_handler(
 async fn v1_chat_completions_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
+    raw_body: Bytes,
 ) -> impl IntoResponse {
     if let Err(status) = ensure_authorized(&headers, &state) {
         return (status, Json(json!({"error":"unauthorized"}))).into_response();
     }
+
+    let raw_request_body = String::from_utf8_lossy(&raw_body).to_string();
+    let req: ChatCompletionRequest = match serde_json::from_slice(&raw_body) {
+        Ok(req) => req,
+        Err(err) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":format!("invalid request body: {err}")})),
+            )
+                .into_response();
+        }
+    };
 
     if req.messages.is_empty() {
         return (
@@ -758,6 +772,7 @@ async fn v1_chat_completions_handler(
                 &state.settings,
                 "/v1/chat/completions",
                 &request_log,
+                Some(&raw_request_body),
                 StatusCode::OK,
                 &response_json,
             )
@@ -803,6 +818,7 @@ async fn v1_chat_completions_handler(
             &state.settings,
             "/v1/chat/completions",
             &request_log,
+            Some(&raw_request_body),
             StatusCode::OK,
             &response_json,
         )
@@ -823,6 +839,7 @@ async fn v1_chat_completions_handler(
                 &state.settings,
                 "/v1/chat/completions",
                 &request_log,
+                Some(&raw_request_body),
                 StatusCode::BAD_GATEWAY,
                 &response_json,
             )
@@ -916,6 +933,7 @@ async fn v1_chat_completions_handler(
                 &state.settings,
                 "/v1/chat/completions",
                 &request_log,
+                Some(&raw_request_body),
                 StatusCode::BAD_GATEWAY,
                 &response_json,
             )
@@ -931,6 +949,7 @@ async fn v1_chat_completions_handler(
             &state.settings,
             "/v1/chat/completions",
             &request_log,
+            Some(&raw_request_body),
             StatusCode::OK,
             &json!({"stream":true,"status":"started"}),
         )
@@ -1131,6 +1150,7 @@ async fn v1_chat_completions_handler(
                     &state.settings,
                     "/v1/chat/completions",
                     &request_log,
+                    Some(&raw_request_body),
                     StatusCode::OK,
                     &response_json,
                 )
@@ -1161,6 +1181,7 @@ async fn v1_chat_completions_handler(
         &state.settings,
         "/v1/chat/completions",
         &request_log,
+        Some(&raw_request_body),
         StatusCode::BAD_GATEWAY,
         &response_json,
     )
@@ -1291,7 +1312,7 @@ async fn refresh_cookies_handler(
 async fn v1_messages_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
-    payload: Result<Json<ClaudeMessagesRequest>, JsonRejection>,
+    raw_body: Bytes,
 ) -> impl IntoResponse {
     // Claude uses x-api-key header instead of Bearer token
     if let Some(expected) = &state.settings.api_key {
@@ -1309,10 +1330,12 @@ async fn v1_messages_handler(
         }
     }
 
-    let req = match payload {
-        Ok(Json(req)) => req,
-        Err(rej) => {
-            let reason = rej.body_text();
+    let raw_request_body = String::from_utf8_lossy(&raw_body).to_string();
+
+    let req = match serde_json::from_slice::<ClaudeMessagesRequest>(&raw_body) {
+        Ok(req) => req,
+        Err(err) => {
+            let reason = err.to_string();
             error!(
                 endpoint = "/v1/messages",
                 error = %reason,
@@ -1512,6 +1535,7 @@ async fn v1_messages_handler(
             &state.settings,
             "/v1/messages",
             &request_log,
+            Some(&raw_request_body),
             StatusCode::OK,
             &response_json,
         )
@@ -1527,6 +1551,7 @@ async fn v1_messages_handler(
             &state.settings,
             "/v1/messages",
             &request_log,
+            Some(&raw_request_body),
             StatusCode::BAD_GATEWAY,
             &response_json,
         )
@@ -1547,6 +1572,7 @@ async fn v1_messages_handler(
                 &state.settings,
                 "/v1/messages",
                 &request_log,
+                Some(&raw_request_body),
                 StatusCode::OK,
                 &json!({"stream":true,"status":"started","mode":"tool-aware"}),
             )
@@ -1635,6 +1661,7 @@ async fn v1_messages_handler(
                 &state.settings,
                 "/v1/messages",
                 &request_log,
+                Some(&raw_request_body),
                 StatusCode::BAD_GATEWAY,
                 &response_json,
             )
@@ -1650,6 +1677,7 @@ async fn v1_messages_handler(
             &state.settings,
             "/v1/messages",
             &request_log,
+            Some(&raw_request_body),
             StatusCode::OK,
             &json!({"stream":true,"status":"started"}),
         )
@@ -1867,6 +1895,7 @@ async fn v1_messages_handler(
                         &state.settings,
                         "/v1/messages",
                         &request_log,
+                        Some(&raw_request_body),
                         StatusCode::OK,
                         &response_json,
                     )
@@ -1897,6 +1926,7 @@ async fn v1_messages_handler(
                     &state.settings,
                     "/v1/messages",
                     &request_log,
+                    Some(&raw_request_body),
                     StatusCode::OK,
                     &response_json,
                 )
@@ -1927,6 +1957,7 @@ async fn v1_messages_handler(
         &state.settings,
         "/v1/messages",
         &request_log,
+        Some(&raw_request_body),
         StatusCode::BAD_GATEWAY,
         &response_json,
     )
@@ -1987,13 +2018,15 @@ async fn claude_stream_with_tools(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
     tokio::spawn(async move {
-        let _ = tx
-            .send(immediate_message_start_event(
-                msg_id.clone(),
-                model_owned.clone(),
-                input_tokens,
-            ))
-            .await;
+        for event in immediate_text_prelude_events(
+            msg_id.clone(),
+            model_owned.clone(),
+            input_tokens,
+        ) {
+            if tx.send(event).await.is_err() {
+                return;
+            }
+        }
 
         let mut last_err = String::from("unknown upstream error");
 
@@ -2118,36 +2151,40 @@ fn immediate_message_start_event(msg_id: String, model: String, input_tokens: u3
     )
 }
 
+fn immediate_text_prelude_events(msg_id: String, model: String, input_tokens: u32) -> Vec<Event> {
+    vec![
+        immediate_message_start_event(msg_id, model, input_tokens),
+        Event::default().event("content_block_start").data(
+            serde_json::to_string(&ClaudeStreamContentBlockStart {
+                type_field: "content_block_start",
+                index: 0,
+                content_block: ClaudeContentBlock {
+                    type_field: "text",
+                    text: Some(String::new()),
+                    id: None,
+                    name: None,
+                    input: None,
+                },
+            })
+            .unwrap_or_default(),
+        ),
+    ]
+}
+
 fn build_claude_tool_use_followup_events(
     input_tokens: u32,
     remaining_text: String,
     tool_calls: Vec<onyx_client::ParsedToolCall>,
 ) -> Vec<Event> {
     let mut events: Vec<Event> = Vec::new();
-    let mut block_index: u8 = 0;
+    let mut block_index: u8 = 1;
 
     if !remaining_text.is_empty() {
-        events.push(
-            Event::default().event("content_block_start").data(
-                serde_json::to_string(&ClaudeStreamContentBlockStart {
-                    type_field: "content_block_start",
-                    index: block_index,
-                    content_block: ClaudeContentBlock {
-                        type_field: "text",
-                        text: Some(String::new()),
-                        id: None,
-                        name: None,
-                        input: None,
-                    },
-                })
-                .unwrap_or_default(),
-            ),
-        );
         events.push(
             Event::default().event("content_block_delta").data(
                 serde_json::to_string(&ClaudeStreamContentBlockDelta {
                     type_field: "content_block_delta",
-                    index: block_index,
+                    index: 0,
                     delta: ClaudeTextDelta {
                         type_field: "text_delta",
                         text: remaining_text,
@@ -2160,12 +2197,21 @@ fn build_claude_tool_use_followup_events(
             Event::default().event("content_block_stop").data(
                 serde_json::to_string(&ClaudeStreamContentBlockStop {
                     type_field: "content_block_stop",
-                    index: block_index,
+                    index: 0,
                 })
                 .unwrap_or_default(),
             ),
         );
-        block_index += 1;
+    } else {
+        events.push(
+            Event::default().event("content_block_stop").data(
+                serde_json::to_string(&ClaudeStreamContentBlockStop {
+                    type_field: "content_block_stop",
+                    index: 0,
+                })
+                .unwrap_or_default(),
+            ),
+        );
     }
 
     for tc in &tool_calls {
@@ -2241,32 +2287,19 @@ fn build_claude_tool_use_followup_events(
 
 fn build_claude_text_followup_events(input_tokens: u32, content: String) -> Vec<Event> {
     let mut events: Vec<Event> = Vec::new();
-    events.push(Event::default().event("content_block_start").data(
-        serde_json::to_string(&ClaudeStreamContentBlockStart {
-            type_field: "content_block_start",
-            index: 0,
-            content_block: ClaudeContentBlock {
-                type_field: "text",
-                text: Some(String::new()),
-                id: None,
-                name: None,
-                input: None,
-            },
-        })
-        .unwrap_or_default(),
-    ));
-
-    events.push(Event::default().event("content_block_delta").data(
-        serde_json::to_string(&ClaudeStreamContentBlockDelta {
-            type_field: "content_block_delta",
-            index: 0,
-            delta: ClaudeTextDelta {
-                type_field: "text_delta",
-                text: content,
-            },
-        })
-        .unwrap_or_default(),
-    ));
+    if !content.is_empty() {
+        events.push(Event::default().event("content_block_delta").data(
+            serde_json::to_string(&ClaudeStreamContentBlockDelta {
+                type_field: "content_block_delta",
+                index: 0,
+                delta: ClaudeTextDelta {
+                    type_field: "text_delta",
+                    text: content,
+                },
+            })
+            .unwrap_or_default(),
+        ));
+    }
 
     events.push(Event::default().event("content_block_stop").data(
         serde_json::to_string(&ClaudeStreamContentBlockStop {
@@ -2648,6 +2681,7 @@ async fn append_proxy_audit_record(
     settings: &Settings,
     endpoint: &str,
     request: &serde_json::Value,
+    raw_request_body: Option<&str>,
     status: StatusCode,
     response: &serde_json::Value,
 ) {
@@ -2669,6 +2703,7 @@ async fn append_proxy_audit_record(
         ts_ms: now_unix_ms(),
         endpoint: endpoint.to_string(),
         status: status.as_u16(),
+        raw_request_body: raw_request_body.map(|s| s.to_string()),
         request: request.clone(),
         response: response.clone(),
     };

@@ -7,6 +7,7 @@ use rust_proxy::{
     config::Settings,
     server::{build_router, build_state},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 use tower::util::ServiceExt;
 
 fn test_router() -> axum::Router {
@@ -35,6 +36,17 @@ fn test_router_with_invalid_upstream() -> axum::Router {
         onyx_auth_cookie: "test-cookie-1".to_string(),
         request_timeout_secs: 1,
         api_key: None,
+        ..Settings::default()
+    })
+    .expect("state should build");
+    build_router(state)
+}
+
+fn test_router_with_audit_log(path: &str) -> axum::Router {
+    let state = build_state(Settings {
+        onyx_auth_cookie: "test-cookie-1,test-cookie-2".to_string(),
+        api_key: None,
+        request_audit_log_path: path.to_string(),
         ..Settings::default()
     })
     .expect("state should build");
@@ -679,6 +691,42 @@ async fn claude_messages_invalid_json_returns_reason_text() {
         message.contains("invalid request body:"),
         "422 response should include parse reason prefix: {message}"
     );
+}
+
+#[tokio::test]
+async fn claude_messages_audit_log_captures_raw_request_body() {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let audit_path = format!("/tmp/rust-proxy-raw-request-{ts}.jsonl");
+    let app = test_router_with_audit_log(&audit_path);
+
+    let raw_body = r#"{"model":"claude-opus-4.6","messages":[{"role":"user","content":"Use the bash tool to run: pwd"}],"tools":[{"name":"bash","description":"run shell","input_schema":{"type":"object"}}],"max_tokens":1024,"stream":false}"#;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(raw_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let audit = tokio::fs::read_to_string(&audit_path)
+        .await
+        .expect("audit file should exist");
+    let last = audit.lines().last().expect("audit log should contain one line");
+    let json: Value = serde_json::from_str(last).expect("audit record should be valid json");
+    assert_eq!(json["endpoint"], "/v1/messages");
+    assert_eq!(json["raw_request_body"], raw_body);
+
+    let _ = tokio::fs::remove_file(&audit_path).await;
 }
 
 #[tokio::test]
