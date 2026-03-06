@@ -2456,6 +2456,10 @@ fn maybe_build_local_tool_call_from_claude_request(
 }
 
 fn maybe_build_local_tool_call(tool_names: &[String], user_message: &str) -> Option<LocalToolCall> {
+    if looks_like_embedded_source_dump(user_message) {
+        return None;
+    }
+
     let supports_bash = tool_names.iter().any(|name| name.eq_ignore_ascii_case("bash"));
     let supports_write = tool_names
         .iter()
@@ -2600,6 +2604,30 @@ fn extract_write_content_from_text(input: &str) -> Option<String> {
 
 fn escape_shell_double_quotes(input: &str) -> String {
     input.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn looks_like_embedded_source_dump(input: &str) -> bool {
+    if input.contains("<path>") || input.contains("<content>") {
+        return true;
+    }
+
+    let normalized = input.replace("\\n", "\n");
+    let mut annotated_lines = 0;
+    for line in normalized.lines() {
+        let trimmed = line.trim_start();
+        let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_count > 0 {
+            let rest = &trimmed[digit_count..];
+            if rest.starts_with('#') && rest.contains('|') {
+                annotated_lines += 1;
+                if annotated_lines >= 2 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn now_ts() -> u64 {
@@ -2841,6 +2869,31 @@ mod tests {
         assert!(
             tool_call.is_none(),
             "local tool call must be skipped when request already contains tool_result blocks"
+        );
+    }
+
+    #[test]
+    fn claude_messages_embedded_source_dump_does_not_generate_local_tool_call() {
+        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<path>/tmp/foo.rs</path>\n<content>\n718#YW|    assert!(\n719#PP|        rendered.contains(\"Use the bash tool to run: pwd\"),\n720#ZH|        \"should explicitly mark root cause\"\n721#PJ|    );\n</content>"
+                }
+            ],
+            "tools": [
+                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}}
+            ],
+            "max_tokens": 1024,
+            "stream": true
+        }))
+        .expect("request should deserialize");
+
+        let tool_call = maybe_build_local_tool_call_from_claude_request(&req);
+        assert!(
+            tool_call.is_none(),
+            "embedded source dumps must not trigger local tool synthesis"
         );
     }
 

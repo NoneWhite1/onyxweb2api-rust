@@ -15,6 +15,8 @@ use crate::{
 
 const MAX_SEND_CHAT_ATTEMPTS: usize = 3;
 const SEND_CHAT_RETRY_BACKOFF_MS: u64 = 250;
+const MAX_TOOL_CALL_JSON_LEN: usize = 16 * 1024;
+const MAX_BASH_COMMAND_LEN: usize = 1024;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct OnyxToolMetadata {
@@ -1224,7 +1226,9 @@ pub fn extract_tool_calls_from_text(text: &str) -> (Vec<ParsedToolCall>, String)
             let after_tag = &rest[start_pos + "<tool_call>".len()..];
             if let Some(end_pos) = after_tag.find("</tool_call>") {
                 let json_str = after_tag[..end_pos].trim();
-                if let Some(tc) = parse_tool_call_json(json_str) {
+                let block_contains_nested_tags = json_str.contains("<tool_call>")
+                    || json_str.contains("</tool_call>");
+                if !block_contains_nested_tags && let Some(tc) = parse_tool_call_json(json_str) {
                     tool_calls.push(tc);
                 } else {
                     // Failed to parse — keep original text
@@ -1246,7 +1250,55 @@ pub fn extract_tool_calls_from_text(text: &str) -> (Vec<ParsedToolCall>, String)
     (tool_calls, remaining)
 }
 
+fn value_contains_tool_call_marker(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.contains("<tool_call>") || s.contains("</tool_call>"),
+        Value::Array(items) => items.iter().any(value_contains_tool_call_marker),
+        Value::Object(map) => map.values().any(value_contains_tool_call_marker),
+        _ => false,
+    }
+}
+
+fn parsed_tool_call_is_reasonable(name: &str, arguments: &Value) -> bool {
+    match name {
+        "bash" => arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| {
+                command.len() <= MAX_BASH_COMMAND_LEN
+                    && !command.contains("<path>")
+                    && !command.contains("<content>")
+                    && !looks_like_line_annotated_source_dump(command)
+            })
+            .unwrap_or(false),
+        _ => true,
+    }
+}
+
+fn looks_like_line_annotated_source_dump(input: &str) -> bool {
+    let normalized = input.replace("\\n", "\n");
+    let mut matched_lines = 0;
+    for line in normalized.lines() {
+        let trimmed = line.trim_start();
+        let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_count > 0 {
+            let rest = &trimmed[digit_count..];
+            if rest.starts_with('#') && rest.contains('|') {
+                matched_lines += 1;
+                if matched_lines >= 2 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn parse_tool_call_json(json_str: &str) -> Option<ParsedToolCall> {
+    if json_str.len() > MAX_TOOL_CALL_JSON_LEN {
+        return None;
+    }
+
     let v: Value = serde_json::from_str(json_str).ok()?;
     let name = v.get("name")?.as_str()?.to_string();
     if name.is_empty() {
@@ -1256,6 +1308,12 @@ fn parse_tool_call_json(json_str: &str) -> Option<ParsedToolCall> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    if value_contains_tool_call_marker(&arguments) {
+        return None;
+    }
+    if !parsed_tool_call_is_reasonable(&name, &arguments) {
+        return None;
+    }
     Some(ParsedToolCall { name, arguments })
 }
 
@@ -1568,6 +1626,55 @@ data: [DONE]"#;
         assert!(calls.is_empty());
         // malformed content is kept as-is
         assert!(!remaining.is_empty());
+    }
+
+    #[test]
+    fn extract_tool_calls_ignores_nested_tool_call_markers_inside_arguments() {
+        let text = r#"<tool_call>
+{"name": "bash", "arguments": {"command": "echo before <tool_call> embedded"}}
+</tool_call>"#;
+        let (calls, remaining) = super::extract_tool_calls_from_text(text);
+        assert!(calls.is_empty(), "nested marker content should not be parsed as a valid tool call");
+        assert!(!remaining.is_empty(), "nested marker block should be preserved as plain text");
+    }
+
+    #[test]
+    fn extract_tool_calls_ignores_oversized_tool_call_blocks() {
+        let huge = "x".repeat(20_000);
+        let text = format!(
+            "<tool_call>\n{{\"name\": \"bash\", \"arguments\": {{\"command\": \"{}\"}}}}\n</tool_call>",
+            huge
+        );
+        let (calls, remaining) = super::extract_tool_calls_from_text(&text);
+        assert!(calls.is_empty(), "oversized blocks should be rejected to avoid corrupted extraction");
+        assert!(!remaining.is_empty(), "oversized block should remain in plain text output");
+    }
+
+    #[test]
+    fn extract_tool_calls_rejects_suspiciously_large_bash_command() {
+        let polluted = format!(
+            "pwd\\\"}} trailing {}",
+            "A".repeat(3000)
+        );
+        let text = format!(
+            "<tool_call>\n{{\"name\":\"bash\",\"arguments\":{{\"command\":\"{}\"}}}}\n</tool_call>",
+            polluted
+        );
+        let (calls, remaining) = super::extract_tool_calls_from_text(&text);
+        assert!(calls.is_empty(), "oversized bash command payload should be rejected");
+        assert!(!remaining.is_empty(), "rejected bash block should remain in plain text output");
+    }
+
+    #[test]
+    fn extract_tool_calls_rejects_line_annotated_source_dump_in_bash_command() {
+        let polluted = "pwd\n722#JV| some rust source\n723#XQ| another line";
+        let text = format!(
+            "<tool_call>\n{{\"name\":\"bash\",\"arguments\":{{\"command\":\"{}\"}}}}\n</tool_call>",
+            polluted.replace('\n', "\\n")
+        );
+        let (calls, remaining) = super::extract_tool_calls_from_text(&text);
+        assert!(calls.is_empty(), "line-annotated source dump should be rejected as bash command");
+        assert!(!remaining.is_empty(), "rejected polluted block should remain as plain text");
     }
 
     #[test]
