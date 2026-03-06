@@ -1977,137 +1977,155 @@ async fn claude_stream_with_tools(
     forced_tool_name: Option<&str>,
     input_tokens: u32,
 ) -> axum::response::Response {
-    let mut last_err = String::from("unknown upstream error");
+    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
+    let model_owned = model.to_string();
+    let state = state.clone();
+    let cookie_values = cookie_values.to_vec();
+    let chat_messages = chat_messages.to_vec();
+    let requested_tool_names = requested_tool_names.to_vec();
+    let forced_tool_name = forced_tool_name.map(|s| s.to_string());
 
-    for cookie in cookie_values {
-        let (allowed_tool_ids, forced_tool_id) =
-            match resolve_tool_selection_for_cookie(
+    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
+    tokio::spawn(async move {
+        let _ = tx
+            .send(immediate_message_start_event(
+                msg_id.clone(),
+                model_owned.clone(),
+                input_tokens,
+            ))
+            .await;
+
+        let mut last_err = String::from("unknown upstream error");
+
+        for cookie in cookie_values {
+            let (allowed_tool_ids, forced_tool_id) =
+                match resolve_tool_selection_for_cookie(
+                    &state.http_client,
+                    &state.settings,
+                    &cookie,
+                    &requested_tool_names,
+                    forced_tool_name.as_deref(),
+                )
+                .await
+                {
+                    Ok(selection) => selection,
+                    Err(err) => {
+                        let err_msg = onyx_client::format_error_chain(&err);
+                        let cookie_fp = crate::cookie_manager::fingerprint(&cookie);
+                        error!(
+                            endpoint = "/v1/messages",
+                            mode = "stream+tools",
+                            cookie = %cookie_fp,
+                            error = %err_msg,
+                            "tool translation failed"
+                        );
+                        let mut cm = state.cookie_manager.write().await;
+                        mark_cookie_failure(&mut cm, &cookie, err_msg.clone());
+                        cm.save();
+                        last_err = err_msg;
+                        continue;
+                    }
+                };
+
+            match onyx_client::full_chat(
                 &state.http_client,
                 &state.settings,
-                cookie,
-                requested_tool_names,
-                forced_tool_name,
+                &cookie,
+                &chat_messages,
+                &model_owned,
+                allowed_tool_ids.as_deref(),
+                forced_tool_id,
             )
             .await
             {
-                Ok(selection) => selection,
+                Ok((content, _thinking)) => {
+                    let mut cm = state.cookie_manager.write().await;
+                    cm.mark_call_success(&cookie);
+                    cm.save();
+
+                    let (tool_calls, remaining_text) =
+                        onyx_client::extract_tool_calls_from_text(&content);
+
+                    let events = if !tool_calls.is_empty() {
+                        build_claude_tool_use_followup_events(
+                            input_tokens,
+                            remaining_text,
+                            tool_calls,
+                        )
+                    } else {
+                        build_claude_text_followup_events(input_tokens, content)
+                    };
+
+                    for event in events {
+                        if tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    return;
+                }
                 Err(err) => {
                     let err_msg = onyx_client::format_error_chain(&err);
-                    let cookie_fp = crate::cookie_manager::fingerprint(cookie);
+                    let cookie_fp = crate::cookie_manager::fingerprint(&cookie);
                     error!(
                         endpoint = "/v1/messages",
                         mode = "stream+tools",
                         cookie = %cookie_fp,
                         error = %err_msg,
-                        "tool translation failed"
+                        "claude stream+tools upstream failed"
                     );
                     let mut cm = state.cookie_manager.write().await;
-                    mark_cookie_failure(&mut cm, cookie, err_msg.clone());
+                    mark_cookie_failure(&mut cm, &cookie, err_msg.clone());
                     cm.save();
                     last_err = err_msg;
-                    continue;
                 }
-            };
-
-        match onyx_client::full_chat(
-            &state.http_client,
-            &state.settings,
-            cookie,
-            chat_messages,
-            model,
-            allowed_tool_ids.as_deref(),
-            forced_tool_id,
-        )
-        .await
-        {
-            Ok((content, _thinking)) => {
-                let mut cm = state.cookie_manager.write().await;
-                cm.mark_call_success(cookie);
-                cm.save();
-
-                let (tool_calls, remaining_text) =
-                    onyx_client::extract_tool_calls_from_text(&content);
-
-                let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
-                let model_owned = model.to_string();
-
-                if !tool_calls.is_empty() {
-                    return emit_claude_tool_use_sse_stream(
-                        msg_id,
-                        model_owned,
-                        input_tokens,
-                        remaining_text,
-                        tool_calls,
-                    );
-                }
-
-                // No tool_calls detected — emit as normal text stream
-                return emit_claude_text_sse_stream(
-                    msg_id,
-                    model_owned,
-                    input_tokens,
-                    content,
-                );
-            }
-            Err(err) => {
-                let err_msg = onyx_client::format_error_chain(&err);
-                let cookie_fp = crate::cookie_manager::fingerprint(cookie);
-                error!(
-                    endpoint = "/v1/messages",
-                    mode = "stream+tools",
-                    cookie = %cookie_fp,
-                    error = %err_msg,
-                    "claude stream+tools upstream failed"
-                );
-                let mut cm = state.cookie_manager.write().await;
-                mark_cookie_failure(&mut cm, cookie, err_msg.clone());
-                cm.save();
-                last_err = err_msg;
             }
         }
-    }
 
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}})),
-    )
-        .into_response()
+        for event in build_claude_text_followup_events(
+            input_tokens,
+            format!("upstream failure: {last_err}"),
+        ) {
+            if tx.send(event).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let sse_stream = stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|event| (Ok::<_, Infallible>(event), rx))
+    });
+    Sse::new(sse_stream).into_response()
 }
 
-/// Emit a Claude SSE stream with tool_use content blocks.
-fn emit_claude_tool_use_sse_stream(
-    msg_id: String,
-    model: String,
+fn immediate_message_start_event(msg_id: String, model: String, input_tokens: u32) -> Event {
+    Event::default().event("message_start").data(
+        serde_json::to_string(&ClaudeStreamMessageStart {
+            type_field: "message_start",
+            message: ClaudeStreamMessageMeta {
+                id: msg_id,
+                type_field: "message",
+                role: "assistant",
+                content: vec![],
+                model,
+                stop_reason: None,
+                usage: ClaudeUsage {
+                    input_tokens,
+                    output_tokens: 0,
+                },
+            },
+        })
+        .unwrap_or_default(),
+    )
+}
+
+fn build_claude_tool_use_followup_events(
     input_tokens: u32,
     remaining_text: String,
     tool_calls: Vec<onyx_client::ParsedToolCall>,
-) -> axum::response::Response {
-    // Pre-build all SSE events as a Vec, then stream them in order.
+) -> Vec<Event> {
     let mut events: Vec<Event> = Vec::new();
-
-    // 1) message_start
-    let start = ClaudeStreamMessageStart {
-        type_field: "message_start",
-        message: ClaudeStreamMessageMeta {
-            id: msg_id,
-            type_field: "message",
-            role: "assistant",
-            content: vec![],
-            model,
-            stop_reason: None,
-            usage: ClaudeUsage {
-                input_tokens,
-                output_tokens: 0,
-            },
-        },
-    };
-    events.push(Event::default().event("message_start").data(
-        serde_json::to_string(&start).unwrap_or_default(),
-    ));
-
     let mut block_index: u8 = 0;
 
-    // 2) Optional text block if there's remaining text
     if !remaining_text.is_empty() {
         events.push(
             Event::default().event("content_block_start").data(
@@ -2150,7 +2168,6 @@ fn emit_claude_tool_use_sse_stream(
         block_index += 1;
     }
 
-    // 3) tool_use blocks
     for tc in &tool_calls {
         let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
         let tool_input_json = serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string());
@@ -2196,7 +2213,6 @@ fn emit_claude_tool_use_sse_stream(
         block_index += 1;
     }
 
-    // 4) message_delta with stop_reason=tool_use
     events.push(
         Event::default().event("message_delta").data(
             serde_json::to_string(&ClaudeStreamMessageDelta {
@@ -2212,8 +2228,6 @@ fn emit_claude_tool_use_sse_stream(
             .unwrap_or_default(),
         ),
     );
-
-    // 5) message_stop
     events.push(
         Event::default().event("message_stop").data(
             serde_json::to_string(&ClaudeStreamMessageStop {
@@ -2222,42 +2236,11 @@ fn emit_claude_tool_use_sse_stream(
             .unwrap_or_default(),
         ),
     );
-
-    let sse_stream = stream::unfold(events.into_iter(), |mut iter| async move {
-        iter.next().map(|event| (Ok::<_, Infallible>(event), iter))
-    });
-
-    Sse::new(sse_stream).into_response()
+    events
 }
 
-/// Emit a Claude SSE stream with plain text content (no tool_calls).
-fn emit_claude_text_sse_stream(
-    msg_id: String,
-    model: String,
-    input_tokens: u32,
-    content: String,
-) -> axum::response::Response {
+fn build_claude_text_followup_events(input_tokens: u32, content: String) -> Vec<Event> {
     let mut events: Vec<Event> = Vec::new();
-
-    events.push(Event::default().event("message_start").data(
-        serde_json::to_string(&ClaudeStreamMessageStart {
-            type_field: "message_start",
-            message: ClaudeStreamMessageMeta {
-                id: msg_id,
-                type_field: "message",
-                role: "assistant",
-                content: vec![],
-                model,
-                stop_reason: None,
-                usage: ClaudeUsage {
-                    input_tokens,
-                    output_tokens: 0,
-                },
-            },
-        })
-        .unwrap_or_default(),
-    ));
-
     events.push(Event::default().event("content_block_start").data(
         serde_json::to_string(&ClaudeStreamContentBlockStart {
             type_field: "content_block_start",
@@ -2314,11 +2297,7 @@ fn emit_claude_text_sse_stream(
         .unwrap_or_default(),
     ));
 
-    let sse_stream = stream::unfold(events.into_iter(), |mut iter| async move {
-        iter.next().map(|event| (Ok::<_, Infallible>(event), iter))
-    });
-
-    Sse::new(sse_stream).into_response()
+    events
 }
 
 async fn resolve_tool_selection_for_cookie(
@@ -2694,7 +2673,8 @@ async fn append_proxy_audit_record(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_cookie_failure, maybe_build_local_tool_call_from_chat_request,
+        classify_cookie_failure, immediate_message_start_event,
+        maybe_build_local_tool_call_from_chat_request,
         maybe_build_local_tool_call_from_claude_request, next_round_robin_offset,
         rotate_cookie_values,
     };
@@ -2881,5 +2861,14 @@ mod tests {
         assert_eq!(next_round_robin_offset(&counter, 3), 1);
         assert_eq!(next_round_robin_offset(&counter, 3), 2);
         assert_eq!(next_round_robin_offset(&counter, 3), 0);
+    }
+
+    #[test]
+    fn immediate_message_start_event_uses_expected_claude_shape() {
+        let event = immediate_message_start_event("msg_123".to_string(), "claude-opus-4.6".to_string(), 42);
+        let rendered = format!("{:?}", event);
+        assert!(rendered.contains("message_start"));
+        assert!(rendered.contains("msg_123"));
+        assert!(rendered.contains("claude-opus-4.6"));
     }
 }
