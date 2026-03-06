@@ -1,14 +1,20 @@
 use anyhow::{Context, anyhow};
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::{
     config::Settings,
     models::{ChatMessage, ClaudeToolDefinition, DEFAULT_MODEL},
 };
+
+const MAX_SEND_CHAT_ATTEMPTS: usize = 3;
+const SEND_CHAT_RETRY_BACKOFF_MS: u64 = 250;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct OnyxToolMetadata {
@@ -26,25 +32,64 @@ pub async fn fetch_available_tools(
     settings: &Settings,
     cookie: &str,
 ) -> anyhow::Result<Vec<OnyxToolMetadata>> {
-    let response = client
+    let request_payload = serde_json::json!({});
+    let response = match client
         .get(format!("{}/api/tool", settings.onyx_base_url))
         .header("Cookie", format!("fastapiusersauth={cookie}"))
         .header("Origin", &settings.onyx_origin_url)
         .header("Referer", &settings.onyx_referer)
         .send()
         .await
-        .context("failed to call tool catalog endpoint")?;
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            let wrapped = anyhow!(err).context("failed to call tool catalog endpoint");
+            append_upstream_error_record(
+                settings,
+                "tool-catalog",
+                "request_send",
+                cookie,
+                &request_payload,
+                None,
+                &format_error_chain(&wrapped),
+            )
+            .await;
+            return Err(wrapped);
+        }
+    };
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED
         || response.status() == reqwest::StatusCode::FORBIDDEN
     {
-        return Err(anyhow!("onyx auth failed: {}", response.status().as_u16()));
+        let err = anyhow!("onyx auth failed: {}", response.status().as_u16());
+        append_upstream_error_record(
+            settings,
+            "tool-catalog",
+            "http_auth",
+            cookie,
+            &request_payload,
+            Some(response.status().as_u16()),
+            &err.to_string(),
+        )
+        .await;
+        return Err(err);
     }
 
     if !response.status().is_success() {
         let code = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("onyx tool catalog HTTP {code}: {body}"));
+        let err = anyhow!("onyx tool catalog HTTP {code}: {body}");
+        append_upstream_error_record(
+            settings,
+            "tool-catalog",
+            "http_status",
+            cookie,
+            &request_payload,
+            Some(code),
+            &err.to_string(),
+        )
+        .await;
+        return Err(err);
     }
 
     let payload: Value = response
@@ -167,32 +212,131 @@ async fn send_chat_message_text(
     cookie: &str,
     payload: &Value,
 ) -> anyhow::Result<String> {
-    let response = client
-        .post(format!("{}/api/chat/send-chat-message", settings.onyx_base_url))
-        .header("Cookie", format!("fastapiusersauth={cookie}"))
-        .header("Origin", &settings.onyx_origin_url)
-        .header("Referer", &settings.onyx_referer)
-        .json(payload)
-        .send()
-        .await
-        .context("failed to call send-chat-message")?;
+    for attempt in 1..=MAX_SEND_CHAT_ATTEMPTS {
+        let response = match client
+            .post(format!("{}/api/chat/send-chat-message", settings.onyx_base_url))
+            .header("Cookie", format!("fastapiusersauth={cookie}"))
+            .header("Origin", &settings.onyx_origin_url)
+            .header("Referer", &settings.onyx_referer)
+            .json(payload)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                let wrapped = anyhow!(err).context("failed to call send-chat-message");
+                append_upstream_error_record(
+                    settings,
+                    "send-chat-message",
+                    "request_send",
+                    cookie,
+                    payload,
+                    None,
+                    &format_error_chain(&wrapped),
+                )
+                .await;
 
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED
-        || response.status() == reqwest::StatusCode::FORBIDDEN
-    {
-        return Err(anyhow!("onyx auth failed: {}", response.status().as_u16()));
+                if attempt < MAX_SEND_CHAT_ATTEMPTS && is_retryable_upstream_io_error(&wrapped) {
+                    tokio::time::sleep(Duration::from_millis(
+                        SEND_CHAT_RETRY_BACKOFF_MS * attempt as u64,
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(wrapped);
+            }
+        };
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            || response.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            let err = anyhow!("onyx auth failed: {}", response.status().as_u16());
+            append_upstream_error_record(
+                settings,
+                "send-chat-message",
+                "http_auth",
+                cookie,
+                payload,
+                Some(response.status().as_u16()),
+                &err.to_string(),
+            )
+            .await;
+            return Err(err);
+        }
+
+        if !response.status().is_success() {
+            let code = response.status().as_u16();
+            let body = match response.text().await {
+                Ok(text) => text,
+                Err(err) => {
+                    let wrapped = anyhow!(err).context("failed to read response body");
+                    append_upstream_error_record(
+                        settings,
+                        "send-chat-message",
+                        "http_error_body_read",
+                        cookie,
+                        payload,
+                        Some(code),
+                        &format_error_chain(&wrapped),
+                    )
+                    .await;
+                    if attempt < MAX_SEND_CHAT_ATTEMPTS
+                        && is_retryable_upstream_io_error(&wrapped)
+                    {
+                        tokio::time::sleep(Duration::from_millis(
+                            SEND_CHAT_RETRY_BACKOFF_MS * attempt as u64,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    return Err(wrapped);
+                }
+            };
+
+            let err = anyhow!("onyx send-chat-message HTTP {code}: {body}");
+            append_upstream_error_record(
+                settings,
+                "send-chat-message",
+                "http_status",
+                cookie,
+                payload,
+                Some(code),
+                &err.to_string(),
+            )
+            .await;
+            return Err(err);
+        }
+
+        match response.text().await {
+            Ok(text) => return Ok(text),
+            Err(err) => {
+                let wrapped = anyhow!(err).context("failed to read response body");
+                append_upstream_error_record(
+                    settings,
+                    "send-chat-message",
+                    "response_read",
+                    cookie,
+                    payload,
+                    Some(200),
+                    &format_error_chain(&wrapped),
+                )
+                .await;
+                if attempt < MAX_SEND_CHAT_ATTEMPTS && is_retryable_upstream_io_error(&wrapped) {
+                    tokio::time::sleep(Duration::from_millis(
+                        SEND_CHAT_RETRY_BACKOFF_MS * attempt as u64,
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(wrapped);
+            }
+        }
     }
 
-    if !response.status().is_success() {
-        let code = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("onyx send-chat-message HTTP {code}: {body}"));
-    }
-
-    response
-        .text()
-        .await
-        .context("failed to read response body")
+    Err(anyhow!(
+        "failed to call send-chat-message after {} attempts",
+        MAX_SEND_CHAT_ATTEMPTS
+    ))
 }
 
 fn should_retry_python_syntax_error(content: &str) -> bool {
@@ -233,6 +377,135 @@ pub fn format_error_chain(err: &anyhow::Error) -> String {
     )
 }
 
+#[derive(Debug, Serialize)]
+struct UpstreamErrorRecord {
+    ts_ms: u64,
+    endpoint: String,
+    stage: String,
+    status: Option<u16>,
+    error: String,
+    cookie_fingerprint: String,
+    payload: Value,
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn mask_cookie(cookie: &str) -> String {
+    let len = cookie.chars().count();
+    if len <= 8 {
+        return "***".to_string();
+    }
+    let prefix: String = cookie.chars().take(4).collect();
+    let suffix: String = cookie
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}...{suffix}")
+}
+
+async fn append_upstream_error_record(
+    settings: &Settings,
+    endpoint: &str,
+    stage: &str,
+    cookie: &str,
+    payload: &Value,
+    status: Option<u16>,
+    error: &str,
+) {
+    let path_value = settings.request_error_log_path.trim();
+    if path_value.is_empty() {
+        return;
+    }
+
+    let record = UpstreamErrorRecord {
+        ts_ms: now_unix_ms(),
+        endpoint: endpoint.to_string(),
+        stage: stage.to_string(),
+        status,
+        error: error.to_string(),
+        cookie_fingerprint: mask_cookie(cookie),
+        payload: payload.clone(),
+    };
+
+    let path = Path::new(path_value);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        tracing::error!(
+            log_path = %path.display(),
+            error = %err,
+            "failed to create upstream error log directory"
+        );
+        return;
+    }
+
+    let serialized = match serde_json::to_string(&record) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!(
+                log_path = %path.display(),
+                error = %err,
+                "failed to serialize upstream error record"
+            );
+            return;
+        }
+    };
+
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        Ok(mut file) => {
+            if let Err(err) = file
+                .write_all(format!("{serialized}\n").as_bytes())
+                .await
+            {
+                tracing::error!(
+                    log_path = %path.display(),
+                    error = %err,
+                    "failed to append upstream error log"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                log_path = %path.display(),
+                error = %err,
+                "failed to open upstream error log file"
+            );
+        }
+    }
+}
+
+fn is_retryable_upstream_io_error(err: &anyhow::Error) -> bool {
+    let chain = format_error_chain(err).to_ascii_lowercase();
+    let markers = [
+        "unexpected eof",
+        "chunk size line",
+        "error reading a body from connection",
+        "request or response body error",
+        "error decoding response body",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "timed out",
+        "timeout",
+    ];
+    markers.iter().any(|m| chain.contains(m))
+}
+
 /// Like `full_chat`, but streams parsed events back via an mpsc channel.
 /// The caller receives `StreamEvent` items as they arrive from Onyx.
 pub async fn streaming_chat(
@@ -256,7 +529,7 @@ pub async fn streaming_chat(
         forced_tool_id,
     );
 
-    let response = client
+    let response = match client
         .post(format!("{}/api/chat/send-chat-message", settings.onyx_base_url))
         .header("Cookie", format!("fastapiusersauth={cookie}"))
         .header("Origin", &settings.onyx_origin_url)
@@ -264,24 +537,81 @@ pub async fn streaming_chat(
         .json(&payload)
         .send()
         .await
-        .context("failed to call send-chat-message")?;
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            let wrapped = anyhow!(err).context("failed to call send-chat-message");
+            append_upstream_error_record(
+                settings,
+                "send-chat-message",
+                "stream_request_send",
+                cookie,
+                &payload,
+                None,
+                &format_error_chain(&wrapped),
+            )
+            .await;
+            return Err(wrapped);
+        }
+    };
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED
         || response.status() == reqwest::StatusCode::FORBIDDEN
     {
-        return Err(anyhow!("onyx auth failed: {}", response.status().as_u16()));
+        let err = anyhow!("onyx auth failed: {}", response.status().as_u16());
+        append_upstream_error_record(
+            settings,
+            "send-chat-message",
+            "stream_http_auth",
+            cookie,
+            &payload,
+            Some(response.status().as_u16()),
+            &err.to_string(),
+        )
+        .await;
+        return Err(err);
     }
 
     if !response.status().is_success() {
         let code = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("onyx send-chat-message HTTP {code}: {body}"));
+        let body = match response.text().await {
+            Ok(text) => text,
+            Err(err) => {
+                let wrapped = anyhow!(err).context("failed to read response body");
+                append_upstream_error_record(
+                    settings,
+                    "send-chat-message",
+                    "stream_http_error_body_read",
+                    cookie,
+                    &payload,
+                    Some(code),
+                    &format_error_chain(&wrapped),
+                )
+                .await;
+                return Err(wrapped);
+            }
+        };
+        let err = anyhow!("onyx send-chat-message HTTP {code}: {body}");
+        append_upstream_error_record(
+            settings,
+            "send-chat-message",
+            "stream_http_status",
+            cookie,
+            &payload,
+            Some(code),
+            &err.to_string(),
+        )
+        .await;
+        return Err(err);
     }
 
     let (tx, rx) = mpsc::channel::<StreamEvent>(64);
 
     // Spawn background task reading the byte stream from Onyx
     let byte_stream = response.bytes_stream();
+    let settings_for_stream = settings.clone();
+    let payload_for_stream = payload.clone();
+    let cookie_for_stream = cookie.to_string();
     tokio::spawn(async move {
         let _ = tx.send(StreamEvent::Role).await;
 
@@ -291,7 +621,24 @@ pub async fn streaming_chat(
         while let Some(chunk_result) = byte_stream.next().await {
             let chunk = match chunk_result {
                 Ok(c) => c,
-                Err(_) => break,
+                Err(err) => {
+                    let wrapped = anyhow!(err).context("failed to read streaming response body");
+                    append_upstream_error_record(
+                        &settings_for_stream,
+                        "send-chat-message",
+                        "stream_response_read",
+                        &cookie_for_stream,
+                        &payload_for_stream,
+                        Some(200),
+                        &format_error_chain(&wrapped),
+                    )
+                    .await;
+                    tracing::error!(
+                        error = %format_error_chain(&wrapped),
+                        "streaming Onyx response body read failed"
+                    );
+                    break;
+                }
             };
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -490,7 +837,7 @@ async fn create_chat_session(
         "project_id": null
     });
 
-    let response = client
+    let response = match client
         .post(format!("{}/api/chat/create-chat-session", settings.onyx_base_url))
         .header("Cookie", format!("fastapiusersauth={cookie}"))
         .header("Origin", &settings.onyx_origin_url)
@@ -498,18 +845,56 @@ async fn create_chat_session(
         .json(&payload)
         .send()
         .await
-        .context("failed to call create-chat-session")?;
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            let wrapped = anyhow!(err).context("failed to call create-chat-session");
+            append_upstream_error_record(
+                settings,
+                "create-chat-session",
+                "request_send",
+                cookie,
+                &payload,
+                None,
+                &format_error_chain(&wrapped),
+            )
+            .await;
+            return Err(wrapped);
+        }
+    };
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED
         || response.status() == reqwest::StatusCode::FORBIDDEN
     {
-        return Err(anyhow!("onyx auth failed: {}", response.status().as_u16()));
+        let err = anyhow!("onyx auth failed: {}", response.status().as_u16());
+        append_upstream_error_record(
+            settings,
+            "create-chat-session",
+            "http_auth",
+            cookie,
+            &payload,
+            Some(response.status().as_u16()),
+            &err.to_string(),
+        )
+        .await;
+        return Err(err);
     }
 
     if !response.status().is_success() {
         let code = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("onyx create-chat-session HTTP {code}: {body}"));
+        let err = anyhow!("onyx create-chat-session HTTP {code}: {body}");
+        append_upstream_error_record(
+            settings,
+            "create-chat-session",
+            "http_status",
+            cookie,
+            &payload,
+            Some(code),
+            &err.to_string(),
+        )
+        .await;
+        return Err(err);
     }
 
     let data: Value = response
@@ -673,10 +1058,16 @@ fn resolve_model(model_name: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::config::Settings;
     use crate::models::ChatMessage;
     use serde_json::json;
 
-    use super::{build_prompt, parse_onyx_stream_text};
+    use super::{
+        append_upstream_error_record, build_prompt, is_retryable_upstream_io_error,
+        parse_onyx_stream_text,
+    };
 
     #[test]
     fn parses_nested_obj_event_format() {
@@ -719,6 +1110,55 @@ data: [DONE]"#;
             rendered.contains("root_cause:"),
             "should explicitly mark root cause"
         );
+    }
+
+    #[test]
+    fn retryable_upstream_io_error_detects_chunked_unexpected_eof_chain() {
+        let err = anyhow!("unexpected EOF during chunk size line")
+            .context("error reading a body from connection")
+            .context("request or response body error")
+            .context("error decoding response body")
+            .context("failed to read response body");
+
+        assert!(is_retryable_upstream_io_error(&err));
+    }
+
+    #[test]
+    fn retryable_upstream_io_error_ignores_auth_failure() {
+        let err = anyhow!("onyx auth failed: 401");
+        assert!(!is_retryable_upstream_io_error(&err));
+    }
+
+    #[tokio::test]
+    async fn append_upstream_error_record_writes_jsonl_entry() {
+        let mut settings = Settings::default();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rust_proxy_upstream_error_{ts}.jsonl"));
+        settings.request_error_log_path = path.to_string_lossy().to_string();
+
+        let payload = json!({"message": "hello", "chat_session_id": "abc"});
+        append_upstream_error_record(
+            &settings,
+            "send-chat-message",
+            "response_read",
+            "cookie-123456",
+            &payload,
+            Some(200),
+            "failed to read response body",
+        )
+        .await;
+
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .expect("log file should be written");
+        assert!(content.contains("\"endpoint\":\"send-chat-message\""));
+        assert!(content.contains("\"stage\":\"response_read\""));
+        assert!(content.contains("\"payload\":{"));
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[test]

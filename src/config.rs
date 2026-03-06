@@ -14,6 +14,7 @@ pub struct Settings {
     pub log_level: String,
     pub request_timeout_secs: u64,
     pub cookie_persist_path: String,
+    pub request_error_log_path: String,
 }
 
 impl Settings {
@@ -29,8 +30,7 @@ impl Settings {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
         let onyx_origin = env::var("ONYX_ORIGIN").unwrap_or_else(|_| "webapp".to_string());
-        let onyx_origin_url =
-            env::var("ONYX_ORIGIN_URL").unwrap_or_else(|_| onyx_base_url.clone());
+        let onyx_origin_url = env::var("ONYX_ORIGIN_URL").unwrap_or_else(|_| onyx_base_url.clone());
         let onyx_referer =
             env::var("ONYX_REFERER").unwrap_or_else(|_| "https://cloud.onyx.app/app".to_string());
         let api_key = env::var("API_KEY")
@@ -45,8 +45,10 @@ impl Settings {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(300);
-        let cookie_persist_path = env::var("COOKIE_PERSIST_PATH")
-            .unwrap_or_else(|_| "cookies.json".to_string());
+        let cookie_persist_path =
+            env::var("COOKIE_PERSIST_PATH").unwrap_or_else(|_| "cookies.json".to_string());
+        let request_error_log_path = env::var("REQUEST_ERROR_LOG_PATH")
+            .unwrap_or_else(|_| "request_error_records.jsonl".to_string());
 
         Self {
             host,
@@ -61,6 +63,7 @@ impl Settings {
             log_level,
             request_timeout_secs,
             cookie_persist_path,
+            request_error_log_path,
         }
     }
 }
