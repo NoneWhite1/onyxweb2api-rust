@@ -15,6 +15,7 @@ pub struct Settings {
     pub request_timeout_secs: u64,
     pub cookie_persist_path: String,
     pub request_error_log_path: String,
+    pub request_audit_log_path: String,
 }
 
 impl Settings {
@@ -49,6 +50,8 @@ impl Settings {
             env::var("COOKIE_PERSIST_PATH").unwrap_or_else(|_| "cookies.json".to_string());
         let request_error_log_path = env::var("REQUEST_ERROR_LOG_PATH")
             .unwrap_or_else(|_| "request_error_records.jsonl".to_string());
+        let request_audit_log_path = env::var("REQUEST_AUDIT_LOG_PATH")
+            .unwrap_or_else(|_| "request_audit_records.jsonl".to_string());
 
         Self {
             host,
@@ -64,6 +67,7 @@ impl Settings {
             request_timeout_secs,
             cookie_persist_path,
             request_error_log_path,
+            request_audit_log_path,
         }
     }
 }

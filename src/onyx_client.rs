@@ -79,6 +79,16 @@ pub async fn fetch_available_tools(
         let code = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
         let err = anyhow!("onyx tool catalog HTTP {code}: {body}");
+        append_upstream_audit_record(
+            settings,
+            "tool-catalog",
+            "http_status",
+            cookie,
+            &request_payload,
+            Some(code),
+            &serde_json::json!({"error": body}),
+        )
+        .await;
         append_upstream_error_record(
             settings,
             "tool-catalog",
@@ -96,6 +106,16 @@ pub async fn fetch_available_tools(
         .json()
         .await
         .context("invalid tool catalog response json")?;
+    append_upstream_audit_record(
+        settings,
+        "tool-catalog",
+        "response_success",
+        cookie,
+        &request_payload,
+        Some(200),
+        &payload,
+    )
+    .await;
     parse_tool_catalog_response(payload)
 }
 
@@ -251,6 +271,16 @@ async fn send_chat_message_text(
             || response.status() == reqwest::StatusCode::FORBIDDEN
         {
             let err = anyhow!("onyx auth failed: {}", response.status().as_u16());
+            append_upstream_audit_record(
+                settings,
+                "send-chat-message",
+                "http_auth",
+                cookie,
+                payload,
+                Some(response.status().as_u16()),
+                &serde_json::json!({"error": err.to_string()}),
+            )
+            .await;
             append_upstream_error_record(
                 settings,
                 "send-chat-message",
@@ -294,6 +324,16 @@ async fn send_chat_message_text(
             };
 
             let err = anyhow!("onyx send-chat-message HTTP {code}: {body}");
+            append_upstream_audit_record(
+                settings,
+                "send-chat-message",
+                "http_status",
+                cookie,
+                payload,
+                Some(code),
+                &serde_json::json!({"error": body}),
+            )
+            .await;
             append_upstream_error_record(
                 settings,
                 "send-chat-message",
@@ -308,9 +348,31 @@ async fn send_chat_message_text(
         }
 
         match response.text().await {
-            Ok(text) => return Ok(text),
+            Ok(text) => {
+                append_upstream_audit_record(
+                    settings,
+                    "send-chat-message",
+                    "response_success",
+                    cookie,
+                    payload,
+                    Some(200),
+                    &serde_json::json!({"body": text}),
+                )
+                .await;
+                return Ok(text);
+            }
             Err(err) => {
                 let wrapped = anyhow!(err).context("failed to read response body");
+                append_upstream_audit_record(
+                    settings,
+                    "send-chat-message",
+                    "response_read",
+                    cookie,
+                    payload,
+                    Some(200),
+                    &serde_json::json!({"error": format_error_chain(&wrapped)}),
+                )
+                .await;
                 append_upstream_error_record(
                     settings,
                     "send-chat-message",
@@ -386,6 +448,17 @@ struct UpstreamErrorRecord {
     error: String,
     cookie_fingerprint: String,
     payload: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct UpstreamAuditRecord {
+    ts_ms: u64,
+    endpoint: String,
+    stage: String,
+    status: Option<u16>,
+    cookie_fingerprint: String,
+    payload: Value,
+    response: Value,
 }
 
 fn now_unix_ms() -> u64 {
@@ -489,6 +562,83 @@ async fn append_upstream_error_record(
     }
 }
 
+async fn append_upstream_audit_record(
+    settings: &Settings,
+    endpoint: &str,
+    stage: &str,
+    cookie: &str,
+    payload: &Value,
+    status: Option<u16>,
+    response: &Value,
+) {
+    let path_value = settings.request_audit_log_path.trim();
+    if path_value.is_empty() {
+        return;
+    }
+
+    let record = UpstreamAuditRecord {
+        ts_ms: now_unix_ms(),
+        endpoint: endpoint.to_string(),
+        stage: stage.to_string(),
+        status,
+        cookie_fingerprint: mask_cookie(cookie),
+        payload: payload.clone(),
+        response: response.clone(),
+    };
+
+    let path = Path::new(path_value);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        tracing::error!(
+            log_path = %path.display(),
+            error = %err,
+            "failed to create upstream audit log directory"
+        );
+        return;
+    }
+
+    let serialized = match serde_json::to_string(&record) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!(
+                log_path = %path.display(),
+                error = %err,
+                "failed to serialize upstream audit record"
+            );
+            return;
+        }
+    };
+
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        Ok(mut file) => {
+            if let Err(err) = file
+                .write_all(format!("{serialized}\n").as_bytes())
+                .await
+            {
+                tracing::error!(
+                    log_path = %path.display(),
+                    error = %err,
+                    "failed to append upstream audit log"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                log_path = %path.display(),
+                error = %err,
+                "failed to open upstream audit log file"
+            );
+        }
+    }
+}
+
 fn is_retryable_upstream_io_error(err: &anyhow::Error) -> bool {
     let chain = format_error_chain(err).to_ascii_lowercase();
     let markers = [
@@ -559,6 +709,16 @@ pub async fn streaming_chat(
         || response.status() == reqwest::StatusCode::FORBIDDEN
     {
         let err = anyhow!("onyx auth failed: {}", response.status().as_u16());
+        append_upstream_audit_record(
+            settings,
+            "send-chat-message",
+            "stream_http_auth",
+            cookie,
+            &payload,
+            Some(response.status().as_u16()),
+            &serde_json::json!({"error": err.to_string()}),
+        )
+        .await;
         append_upstream_error_record(
             settings,
             "send-chat-message",
@@ -592,6 +752,16 @@ pub async fn streaming_chat(
             }
         };
         let err = anyhow!("onyx send-chat-message HTTP {code}: {body}");
+        append_upstream_audit_record(
+            settings,
+            "send-chat-message",
+            "stream_http_status",
+            cookie,
+            &payload,
+            Some(code),
+            &serde_json::json!({"error": body}),
+        )
+        .await;
         append_upstream_error_record(
             settings,
             "send-chat-message",
@@ -616,6 +786,7 @@ pub async fn streaming_chat(
         let _ = tx.send(StreamEvent::Role).await;
 
         let mut buffer = String::new();
+        let mut raw_stream_body = String::new();
         tokio::pin!(byte_stream);
 
         while let Some(chunk_result) = byte_stream.next().await {
@@ -623,6 +794,19 @@ pub async fn streaming_chat(
                 Ok(c) => c,
                 Err(err) => {
                     let wrapped = anyhow!(err).context("failed to read streaming response body");
+                    append_upstream_audit_record(
+                        &settings_for_stream,
+                        "send-chat-message",
+                        "stream_response_read",
+                        &cookie_for_stream,
+                        &payload_for_stream,
+                        Some(200),
+                        &serde_json::json!({
+                            "body": raw_stream_body,
+                            "error": format_error_chain(&wrapped)
+                        }),
+                    )
+                    .await;
                     append_upstream_error_record(
                         &settings_for_stream,
                         "send-chat-message",
@@ -641,7 +825,9 @@ pub async fn streaming_chat(
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_text = String::from_utf8_lossy(&chunk).to_string();
+            raw_stream_body.push_str(&chunk_text);
+            buffer.push_str(&chunk_text);
 
             // Process complete lines
             while let Some(newline_pos) = buffer.find('\n') {
@@ -693,6 +879,16 @@ pub async fn streaming_chat(
         }
 
         // If stream ended without an explicit stop event, send Done anyway
+        append_upstream_audit_record(
+            &settings_for_stream,
+            "send-chat-message",
+            "stream_response_complete",
+            &cookie_for_stream,
+            &payload_for_stream,
+            Some(200),
+            &serde_json::json!({"body": raw_stream_body}),
+        )
+        .await;
         let _ = tx.send(StreamEvent::Done).await;
     });
 
@@ -867,6 +1063,16 @@ async fn create_chat_session(
         || response.status() == reqwest::StatusCode::FORBIDDEN
     {
         let err = anyhow!("onyx auth failed: {}", response.status().as_u16());
+        append_upstream_audit_record(
+            settings,
+            "create-chat-session",
+            "http_auth",
+            cookie,
+            &payload,
+            Some(response.status().as_u16()),
+            &serde_json::json!({"error": err.to_string()}),
+        )
+        .await;
         append_upstream_error_record(
             settings,
             "create-chat-session",
@@ -884,6 +1090,16 @@ async fn create_chat_session(
         let code = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
         let err = anyhow!("onyx create-chat-session HTTP {code}: {body}");
+        append_upstream_audit_record(
+            settings,
+            "create-chat-session",
+            "http_status",
+            cookie,
+            &payload,
+            Some(code),
+            &serde_json::json!({"error": body}),
+        )
+        .await;
         append_upstream_error_record(
             settings,
             "create-chat-session",
@@ -901,6 +1117,16 @@ async fn create_chat_session(
         .json()
         .await
         .context("invalid create-chat-session response json")?;
+    append_upstream_audit_record(
+        settings,
+        "create-chat-session",
+        "response_success",
+        cookie,
+        &payload,
+        Some(200),
+        &data,
+    )
+    .await;
 
     data.get("chat_session_id")
         .and_then(|v| v.as_str())
@@ -1065,7 +1291,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        append_upstream_error_record, build_prompt, is_retryable_upstream_io_error,
+        append_upstream_audit_record, append_upstream_error_record, build_prompt,
+        is_retryable_upstream_io_error,
         parse_onyx_stream_text,
     };
 
@@ -1157,6 +1384,39 @@ data: [DONE]"#;
         assert!(content.contains("\"endpoint\":\"send-chat-message\""));
         assert!(content.contains("\"stage\":\"response_read\""));
         assert!(content.contains("\"payload\":{"));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn append_upstream_audit_record_writes_jsonl_entry() {
+        let mut settings = Settings::default();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rust_proxy_upstream_audit_{ts}.jsonl"));
+        settings.request_audit_log_path = path.to_string_lossy().to_string();
+
+        let payload = json!({"message": "hello", "chat_session_id": "abc"});
+        let response = json!({"content": "world"});
+        append_upstream_audit_record(
+            &settings,
+            "send-chat-message",
+            "response_success",
+            "cookie-123456",
+            &payload,
+            Some(200),
+            &response,
+        )
+        .await;
+
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .expect("audit log file should be written");
+        assert!(content.contains("\"endpoint\":\"send-chat-message\""));
+        assert!(content.contains("\"response\":{"));
+        assert!(content.contains("\"content\":\"world\""));
 
         let _ = tokio::fs::remove_file(&path).await;
     }
