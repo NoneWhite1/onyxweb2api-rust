@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -37,6 +38,7 @@ use crate::{
 pub struct AppState {
     pub settings: Settings,
     pub cookie_manager: Arc<RwLock<CookieManager>>,
+    pub rr_counter: Arc<AtomicUsize>,
     pub http_client: reqwest::Client,
     pub started_at_ts: u64,
 }
@@ -84,10 +86,43 @@ pub fn build_state(settings: Settings) -> anyhow::Result<AppState> {
             &settings.cookie_persist_path,
             &settings.onyx_auth_cookie,
         ))),
+        rr_counter: Arc::new(AtomicUsize::new(0)),
         http_client: client,
         started_at_ts: now_ts(),
         settings,
     })
+}
+
+fn rotate_cookie_values(values: Vec<String>, start_index: usize) -> Vec<String> {
+    if values.is_empty() {
+        return values;
+    }
+
+    let offset = start_index % values.len();
+    if offset == 0 {
+        return values;
+    }
+
+    let mut rotated = Vec::with_capacity(values.len());
+    rotated.extend_from_slice(&values[offset..]);
+    rotated.extend_from_slice(&values[..offset]);
+    rotated
+}
+
+fn next_round_robin_offset(counter: &AtomicUsize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    counter.fetch_add(1, Ordering::Relaxed) % len
+}
+
+async fn active_cookie_values_round_robin(state: &AppState) -> Vec<String> {
+    let values = {
+        let cm = state.cookie_manager.read().await;
+        cm.active_cookie_values()
+    };
+    let offset = next_round_robin_offset(&state.rr_counter, values.len());
+    rotate_cookie_values(values, offset)
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -748,10 +783,7 @@ async fn v1_chat_completions_handler(
         let model = req.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let include_reasoning = req.include_reasoning.unwrap_or(true);
 
-        let cookie_values = {
-            let cm = state.cookie_manager.read().await;
-            cm.active_cookie_values()
-        };
+        let cookie_values = active_cookie_values_round_robin(&state).await;
 
         if cookie_values.is_empty() {
             return (
@@ -955,10 +987,7 @@ async fn v1_chat_completions_handler(
     let model = req.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let include_reasoning = req.include_reasoning.unwrap_or(true);
 
-    let cookie_values = {
-        let cm = state.cookie_manager.read().await;
-        cm.active_cookie_values()
-    };
+    let cookie_values = active_cookie_values_round_robin(&state).await;
 
     if cookie_values.is_empty() {
         return (
@@ -1402,10 +1431,7 @@ async fn v1_messages_handler(
         return (StatusCode::OK, Json(json!(response))).into_response();
     }
 
-    let cookie_values = {
-        let cm = state.cookie_manager.read().await;
-        cm.active_cookie_values()
-    };
+    let cookie_values = active_cookie_values_round_robin(&state).await;
 
     if cookie_values.is_empty() {
         return (
@@ -2458,10 +2484,12 @@ fn now_ts() -> u64 {
 mod tests {
     use super::{
         classify_cookie_failure, maybe_build_local_tool_call_from_chat_request,
-        maybe_build_local_tool_call_from_claude_request,
+        maybe_build_local_tool_call_from_claude_request, next_round_robin_offset,
+        rotate_cookie_values,
     };
     use crate::cookie_manager::CookieFailureKind;
     use crate::models::{ChatCompletionRequest, ClaudeMessagesRequest};
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn classify_cookie_failure_marks_auth_error_as_permanent() {
@@ -2623,5 +2651,24 @@ mod tests {
             tool_call.is_none(),
             "local tool call must be skipped when request already contains tool_result blocks"
         );
+    }
+
+    #[test]
+    fn rotate_cookie_values_applies_round_robin_offset() {
+        let values = vec!["cookie-a".to_string(), "cookie-b".to_string(), "cookie-c".to_string()];
+        let rotated = rotate_cookie_values(values, 1);
+        assert_eq!(
+            rotated,
+            vec!["cookie-b".to_string(), "cookie-c".to_string(), "cookie-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn next_round_robin_offset_cycles_through_indexes() {
+        let counter = AtomicUsize::new(0);
+        assert_eq!(next_round_robin_offset(&counter, 3), 0);
+        assert_eq!(next_round_robin_offset(&counter, 3), 1);
+        assert_eq!(next_round_robin_offset(&counter, 3), 2);
+        assert_eq!(next_round_robin_offset(&counter, 3), 0);
     }
 }
