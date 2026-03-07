@@ -10,10 +10,12 @@ use tokio::sync::mpsc;
 use crate::{
     config::Settings,
     models::{ChatMessage, DEFAULT_MODEL},
+    pseudo_tools::strip_noop_trailer,
 };
 
 const MAX_SEND_CHAT_ATTEMPTS: usize = 3;
 const SEND_CHAT_RETRY_BACKOFF_MS: u64 = 250;
+const STREAM_TRAILER_HOLDBACK_CHARS: usize = 512;
 
 pub async fn full_chat(
     client: &reqwest::Client,
@@ -619,6 +621,7 @@ pub async fn streaming_chat(
 
         let mut buffer = String::new();
         let mut raw_stream_body = String::new();
+        let mut pending_content = String::new();
         tokio::pin!(byte_stream);
 
         while let Some(chunk_result) = byte_stream.next().await {
@@ -698,10 +701,12 @@ pub async fn streaming_chat(
                     }
                     Some("message_delta") => {
                         if let Some(c) = obj.get("content").and_then(|v| v.as_str()) {
-                            let _ = tx.send(StreamEvent::Content(c.to_string())).await;
+                            pending_content.push_str(c);
+                            flush_safe_stream_content(&tx, &mut pending_content).await;
                         }
                     }
                     Some("stop") => {
+                        finalize_stream_content(&tx, &mut pending_content).await;
                         let _ = tx.send(StreamEvent::Done).await;
                         return;
                     }
@@ -721,10 +726,50 @@ pub async fn streaming_chat(
             &serde_json::json!({"body": raw_stream_body}),
         )
         .await;
+        finalize_stream_content(&tx, &mut pending_content).await;
         let _ = tx.send(StreamEvent::Done).await;
     });
 
     Ok(rx)
+}
+
+async fn flush_safe_stream_content(tx: &mpsc::Sender<StreamEvent>, pending_content: &mut String) {
+    let char_count = pending_content.chars().count();
+    if char_count <= STREAM_TRAILER_HOLDBACK_CHARS {
+        return;
+    }
+
+    let safe_chars = char_count - STREAM_TRAILER_HOLDBACK_CHARS;
+    let split_idx = nth_char_byte_index(pending_content, safe_chars);
+    let safe_prefix = pending_content[..split_idx].to_string();
+    let safe_prefix = safe_prefix.trim_end_matches(|c: char| c == '\0');
+    if !safe_prefix.is_empty() {
+        let _ = tx.send(StreamEvent::Content(safe_prefix.to_string())).await;
+    }
+    *pending_content = pending_content[split_idx..].to_string();
+}
+
+async fn finalize_stream_content(tx: &mpsc::Sender<StreamEvent>, pending_content: &mut String) {
+    if pending_content.is_empty() {
+        return;
+    }
+
+    let final_content =
+        strip_noop_trailer(pending_content).unwrap_or_else(|| pending_content.clone());
+    if !final_content.is_empty() {
+        let _ = tx.send(StreamEvent::Content(final_content)).await;
+    }
+    pending_content.clear();
+}
+
+fn nth_char_byte_index(s: &str, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    s.char_indices()
+        .nth(n)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len())
 }
 
 fn parse_onyx_stream_text(text: &str) -> (String, String) {
@@ -961,6 +1006,7 @@ fn resolve_model(model_name: &str) -> (String, String) {
 mod tests {
     use anyhow::anyhow;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc;
 
     use crate::config::Settings;
     use crate::models::ChatMessage;
@@ -1149,5 +1195,42 @@ data: [DONE]"#;
     fn retry_trigger_ignores_non_syntaxerror_content() {
         let msg = "Python tool completed successfully.";
         assert!(!super::should_retry_python_syntax_error(msg));
+    }
+
+    #[tokio::test]
+    async fn finalize_stream_content_strips_noop_trailer() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut pending = format!(
+            "Visible text.\n<<<ONYX_TOOL_CALL_9F4C2E7A6B1D8C3E5A0F7B2D4C6E8A1F>>><onyx_tool_call_9f4c2e7a6b1d8c3e5a0f7b2d4c6e8a1f>{{\"action\":\"proxy_noop\",\"action_input\":{{\"status\":\"final\"}}}}</onyx_tool_call_9f4c2e7a6b1d8c3e5a0f7b2d4c6e8a1f>"
+        );
+
+        super::finalize_stream_content(&tx, &mut pending).await;
+
+        match rx.recv().await {
+            Some(super::StreamEvent::Content(text)) => assert_eq!(text, "Visible text."),
+            other => panic!("expected content event, got {other:?}"),
+        }
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flush_safe_stream_content_holds_back_possible_trailer() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut pending = format!(
+            "{}prefix{}",
+            "A".repeat(super::STREAM_TRAILER_HOLDBACK_CHARS + 16),
+            "<<<ONYX_TOOL_CALL_9F4C2E7A6B1D8C3E5A0F7B2D4C6E8A1F>>>"
+        );
+
+        super::flush_safe_stream_content(&tx, &mut pending).await;
+
+        match rx.recv().await {
+            Some(super::StreamEvent::Content(text)) => {
+                assert!(text.contains(&"A".repeat(16)));
+                assert!(!text.contains("<<<ONYX_TOOL_CALL_9F4C2E7A6B1D8C3E5A0F7B2D4C6E8A1F>>>"));
+            }
+            other => panic!("expected content event, got {other:?}"),
+        }
+        assert!(pending.contains("<<<ONYX_TOOL_CALL_9F4C2E7A6B1D8C3E5A0F7B2D4C6E8A1F>>>"));
     }
 }
