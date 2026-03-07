@@ -6,6 +6,9 @@ use crate::models::{
 };
 
 pub const MAX_PROTOCOL_RETRIES: usize = 3;
+pub const TOOL_CALL_SENTINEL: &str = "<<<ONYX_TOOL_CALL_9F4C2E7A6B1D8C3E5A0F7B2D4C6E8A1F>>>";
+pub const TOOL_CALL_OPEN_TAG: &str = "<onyx_tool_call_9f4c2e7a6b1d8c3e5a0f7b2d4c6e8a1f>";
+pub const TOOL_CALL_CLOSE_TAG: &str = "</onyx_tool_call_9f4c2e7a6b1d8c3e5a0f7b2d4c6e8a1f>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolChoiceMode {
@@ -44,6 +47,7 @@ pub enum ParsedPseudoToolResponse {
         content: String,
     },
     Action {
+        preamble_text: Option<String>,
         tool_name: String,
         action_input: Value,
     },
@@ -149,19 +153,19 @@ pub fn parse_pseudo_tool_response(
         });
     }
 
-    if trimmed.contains("```") {
-        return Err(ValidationFailure {
-            code: "DIRTY_JSON",
-            message: "response contained markdown fences".to_string(),
+    let Some(tool_call_block) = extract_tool_call_block(trimmed)? else {
+        return Ok(ParsedPseudoToolResponse::Final {
+            content: trimmed.to_string(),
         });
-    }
+    };
 
-    let value: Value = serde_json::from_str(trimmed).map_err(|err| ValidationFailure {
-        code: "NON_JSON",
-        message: format!("response was not a single valid JSON object: {err}"),
-    })?;
+    let candidate =
+        serde_json::from_str::<Value>(&tool_call_block.json).map_err(|err| ValidationFailure {
+            code: "NON_JSON",
+            message: format!("tool_call block did not contain valid JSON: {err}"),
+        })?;
 
-    let Value::Object(object) = value else {
+    let Value::Object(object) = candidate else {
         return Err(ValidationFailure {
             code: "NON_OBJECT_JSON",
             message: "response JSON must be an object".to_string(),
@@ -173,7 +177,7 @@ pub fn parse_pseudo_tool_response(
 
     match (has_final, has_action) {
         (true, false) => parse_final_response(&object),
-        (false, true) => parse_action_response(&object, context),
+        (false, true) => parse_action_response(&object, context, tool_call_block.preamble_text),
         (true, true) => Err(ValidationFailure {
             code: "AMBIGUOUS_OUTPUT",
             message: "response cannot contain both 'final' and 'action'".to_string(),
@@ -182,6 +186,74 @@ pub fn parse_pseudo_tool_response(
             code: "MISSING_FIELDS",
             message: "response must contain either 'final' or 'action'".to_string(),
         }),
+    }
+}
+
+struct ExtractedToolCallBlock {
+    preamble_text: Option<String>,
+    json: String,
+}
+
+fn extract_tool_call_block(
+    raw_text: &str,
+) -> Result<Option<ExtractedToolCallBlock>, ValidationFailure> {
+    let trimmed_end = raw_text.trim_end();
+    if !trimmed_end.ends_with(TOOL_CALL_CLOSE_TAG) {
+        return Ok(None);
+    }
+
+    let close_index = trimmed_end.rfind(TOOL_CALL_CLOSE_TAG);
+    let open_index = trimmed_end.rfind(TOOL_CALL_OPEN_TAG);
+    let sentinel_index = trimmed_end.rfind(TOOL_CALL_SENTINEL);
+
+    match (sentinel_index, open_index, close_index) {
+        (None, None, None) | (None, None, Some(_)) => Ok(None),
+        (Some(_), None, _) | (None, Some(_), _) | (_, _, None) => Err(ValidationFailure {
+            code: "INVALID_TOOL_BLOCK",
+            message: "tool call block must include sentinel, opening tag, and closing tag"
+                .to_string(),
+        }),
+        (Some(sentinel_start), Some(start), Some(end)) => {
+            if start < sentinel_start || end < start {
+                return Err(ValidationFailure {
+                    code: "INVALID_TOOL_BLOCK",
+                    message: "tool call sentinel/tags were out of order".to_string(),
+                });
+            }
+
+            let sentinel_end = sentinel_start + TOOL_CALL_SENTINEL.len();
+            let between_sentinel_and_tag = trimmed_end[sentinel_end..start].trim();
+            if !between_sentinel_and_tag.is_empty() {
+                return Err(ValidationFailure {
+                    code: "INVALID_TOOL_BLOCK",
+                    message: "tool call opening tag must appear immediately after sentinel"
+                        .to_string(),
+                });
+            }
+
+            let json_start = start + TOOL_CALL_OPEN_TAG.len();
+            let json = trimmed_end[json_start..end].trim();
+            if json.is_empty() {
+                return Err(ValidationFailure {
+                    code: "INVALID_TOOL_BLOCK",
+                    message: "tool call block was empty".to_string(),
+                });
+            }
+
+            let before = trimmed_end[..sentinel_start].trim();
+            let after = trimmed_end[end + TOOL_CALL_CLOSE_TAG.len()..].trim();
+            let preamble_text = match (before.is_empty(), after.is_empty()) {
+                (true, true) => None,
+                (false, true) => Some(before.to_string()),
+                (true, false) => Some(after.to_string()),
+                (false, false) => Some(format!("{}\n{}", before, after)),
+            };
+
+            Ok(Some(ExtractedToolCallBlock {
+                preamble_text,
+                json: json.to_string(),
+            }))
+        }
     }
 }
 
@@ -285,12 +357,8 @@ fn normalize_claude_tool_choice(choice: &ClaudeToolChoice) -> ToolChoiceMode {
 
 fn build_protocol_prompt(context: &ToolPromptContext) -> String {
     let mut prompt = String::from(
-        "You are operating under a strict tool protocol. You must output exactly one JSON object and nothing else. Do not use markdown fences, prose, prefixes, suffixes, or explanations.\n\n",
+        "Request-scoped tool context follows. Use only these request-specific tool rules in addition to your existing base instructions.\n\n",
     );
-
-    prompt.push_str("Allowed response shapes:\n");
-    prompt.push_str("1. {\"action\":\"tool_name\",\"action_input\":{...}}\n");
-    prompt.push_str("2. {\"final\":\"final answer text\"}\n\n");
 
     prompt.push_str("Tool choice policy: ");
     match &context.choice {
@@ -307,6 +375,16 @@ fn build_protocol_prompt(context: &ToolPromptContext) -> String {
             "You must call the tool named '{name}' in this response.\n"
         )),
     }
+
+    prompt.push_str("Response format rules:\n");
+    prompt.push_str("- For a normal answer, reply with plain text only.\n");
+    prompt.push_str("- For a tool call, you must emit exactly one sentinel-prefixed tagged block using this format and nothing else except optional plain-text narration before the sentinel:\n");
+    prompt.push_str(&format!(
+        "  {}\n  {}{{\"action\":\"tool_name\",\"action_input\":{{...}}}}{}\n",
+        TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, TOOL_CALL_CLOSE_TAG
+    ));
+    prompt.push_str("- Do not emit a bare JSON tool call.\n");
+    prompt.push_str("- Do not emit old or alternate tool_call tags.\n");
 
     if context.tools.is_empty() {
         prompt.push_str("No tools are available for this request.\n");
@@ -328,14 +406,14 @@ fn build_protocol_prompt(context: &ToolPromptContext) -> String {
         }
     }
 
-    prompt.push_str("\nIf prior tool results are present in the conversation, use them. After receiving a tool result, either call another tool or return {\"final\":...}. Never repeat a previous invalid output.\n");
+    prompt.push_str("\nIf prior tool results are present in the conversation, use them. After receiving a tool result, either call another tool with the sentinel-prefixed format above or answer in plain text. Never repeat a previous invalid output.\n");
     prompt
 }
 
 fn build_retry_prompt(failure: &ValidationFailure) -> String {
     format!(
-        "Your previous response was discarded. Failure code: {}. Failure reason: {}. Retry now and return exactly one valid JSON object with no extra text.",
-        failure.code, failure.message
+        "Your previous response was discarded. Failure code: {}. Failure reason: {}. Retry now. Use plain text for a final answer, or use exactly this sentinel-prefixed tool-call format for a tool call: {}{}{{\"action\":\"tool_name\",\"action_input\":{{...}}}}{}",
+        failure.code, failure.message, TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, TOOL_CALL_CLOSE_TAG,
     )
 }
 
@@ -372,6 +450,7 @@ fn parse_final_response(
 fn parse_action_response(
     object: &serde_json::Map<String, Value>,
     context: &ToolPromptContext,
+    preamble_text: Option<String>,
 ) -> Result<ParsedPseudoToolResponse, ValidationFailure> {
     if object.len() != 2 || !object.contains_key("action_input") {
         return Err(ValidationFailure {
@@ -440,6 +519,7 @@ fn parse_action_response(
     }
 
     Ok(ParsedPseudoToolResponse::Action {
+        preamble_text: preamble_text.filter(|text| !text.trim().is_empty()),
         tool_name: action_name.to_string(),
         action_input: action_input.clone(),
     })
@@ -586,8 +666,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ParsedPseudoToolResponse, ToolChoiceMode, context_from_openai_request,
-        parse_pseudo_tool_response, should_enable_openai_protocol,
+        ParsedPseudoToolResponse, TOOL_CALL_CLOSE_TAG, TOOL_CALL_OPEN_TAG, TOOL_CALL_SENTINEL,
+        ToolChoiceMode, context_from_openai_request, parse_pseudo_tool_response,
+        should_enable_openai_protocol,
     };
     use crate::models::{ChatCompletionRequest, ChatMessage};
 
@@ -633,16 +714,21 @@ mod tests {
 
         let context = context_from_openai_request(&request);
         let parsed = parse_pseudo_tool_response(
-            r#"{"action":"search_docs","action_input":{"query":"hello"}}"#,
+            &format!(
+                "{}{}{{\"action\":\"search_docs\",\"action_input\":{{\"query\":\"hello\"}}}}{}",
+                TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, TOOL_CALL_CLOSE_TAG
+            ),
             &context,
         )
         .expect("response should parse");
 
         match parsed {
             ParsedPseudoToolResponse::Action {
+                preamble_text,
                 tool_name,
                 action_input,
             } => {
+                assert_eq!(preamble_text, None);
                 assert_eq!(tool_name, "search_docs");
                 assert_eq!(action_input["query"], "hello");
             }
@@ -651,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dirty_json_response() {
+    fn plain_text_with_json_literal_stays_final_text() {
         let request = build_request(json!({
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": "hello"}],
@@ -659,13 +745,116 @@ mod tests {
         }));
 
         let context = context_from_openai_request(&request);
-        let err = parse_pseudo_tool_response(
-            "```json\n{\"action\":\"search_docs\",\"action_input\":{}}\n```",
+        let parsed = parse_pseudo_tool_response(
+            "This is an example JSON snippet: {\"action\":\"search_docs\",\"action_input\":{}}",
             &context,
         )
-        .expect_err("dirty json should fail");
+        .expect("plain text should stay plain text");
 
-        assert_eq!(err.code, "DIRTY_JSON");
+        match parsed {
+            ParsedPseudoToolResponse::Action { .. } => panic!("expected final text"),
+            ParsedPseudoToolResponse::Final { content } => {
+                assert!(content.contains("example JSON snippet"));
+                assert!(content.contains("\"action\":\"search_docs\""));
+            }
+        }
+    }
+
+    #[test]
+    fn parses_tagged_tool_call_with_preamble_text() {
+        let request = build_request(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "bash"}}]
+        }));
+
+        let context = context_from_openai_request(&request);
+        let parsed = parse_pseudo_tool_response(
+            &format!(
+                "I will check the directory first.\n\n{}{}{{\"action\":\"bash\",\"action_input\":{{\"command\":\"ls\"}}}}{}",
+                TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, TOOL_CALL_CLOSE_TAG
+            ),
+            &context,
+        )
+        .expect("tagged tool call should parse");
+
+        match parsed {
+            ParsedPseudoToolResponse::Action {
+                preamble_text,
+                tool_name,
+                action_input,
+            } => {
+                assert_eq!(
+                    preamble_text.as_deref(),
+                    Some("I will check the directory first.")
+                );
+                assert_eq!(tool_name, "bash");
+                assert_eq!(action_input["command"], "ls");
+            }
+            ParsedPseudoToolResponse::Final { .. } => panic!("expected action"),
+        }
+    }
+
+    #[test]
+    fn sentinel_prefixed_tool_call_is_ignored_when_not_at_end() {
+        let request = build_request(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "bash"}}]
+        }));
+
+        let context = context_from_openai_request(&request);
+        let parsed = parse_pseudo_tool_response(
+            &format!(
+                "Example format: {}{}{{\"action\":\"bash\",\"action_input\":{{\"command\":\"ls\"}}}}{} and then continue explaining.",
+                TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, TOOL_CALL_CLOSE_TAG
+            ),
+            &context,
+        )
+        .expect("non-tail tagged block should remain plain text");
+
+        match parsed {
+            ParsedPseudoToolResponse::Final { content } => {
+                assert!(content.contains("Example format:"));
+                assert!(content.contains("and then continue explaining."));
+            }
+            ParsedPseudoToolResponse::Action { .. } => panic!("expected final text"),
+        }
+    }
+
+    #[test]
+    fn tagged_tool_call_may_have_trailing_whitespace_only() {
+        let request = build_request(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "bash"}}]
+        }));
+
+        let context = context_from_openai_request(&request);
+        let parsed = parse_pseudo_tool_response(
+            &format!(
+                "I will check the directory first.\n{}{}{{\"action\":\"bash\",\"action_input\":{{\"command\":\"ls\"}}}}{}\n\n   ",
+                TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, TOOL_CALL_CLOSE_TAG
+            ),
+            &context,
+        )
+        .expect("tail block with trailing whitespace should parse");
+
+        match parsed {
+            ParsedPseudoToolResponse::Action {
+                preamble_text,
+                tool_name,
+                action_input,
+            } => {
+                assert_eq!(
+                    preamble_text.as_deref(),
+                    Some("I will check the directory first.")
+                );
+                assert_eq!(tool_name, "bash");
+                assert_eq!(action_input["command"], "ls");
+            }
+            ParsedPseudoToolResponse::Final { .. } => panic!("expected action"),
+        }
     }
 
     #[test]
@@ -683,11 +872,65 @@ mod tests {
         }));
 
         let context = context_from_openai_request(&request);
-        let err =
-            parse_pseudo_tool_response(r#"{"action":"search_docs","action_input":{}}"#, &context)
-                .expect_err("missing query should fail");
+        let err = parse_pseudo_tool_response(
+            &format!(
+                "{}{}{{\"action\":\"search_docs\",\"action_input\":{{}}}}{}",
+                TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, TOOL_CALL_CLOSE_TAG
+            ),
+            &context,
+        )
+        .expect_err("missing query should fail");
 
         assert_eq!(err.code, "SCHEMA_INVALID");
+    }
+
+    #[test]
+    fn old_tool_call_tag_is_plain_text_without_sentinel() {
+        let request = build_request(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "bash"}}]
+        }));
+
+        let context = context_from_openai_request(&request);
+        let parsed = parse_pseudo_tool_response(
+            "Here is an example only: <tool_call>{\"action\":\"bash\",\"action_input\":{\"command\":\"ls\"}}</tool_call>",
+            &context,
+        )
+        .expect("old tag without sentinel should remain plain text");
+
+        match parsed {
+            ParsedPseudoToolResponse::Final { content } => {
+                assert!(content.contains("<tool_call>"));
+            }
+            ParsedPseudoToolResponse::Action { .. } => panic!("expected final text"),
+        }
+    }
+
+    #[test]
+    fn sentinel_without_hashed_tag_is_plain_text() {
+        let request = build_request(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "bash"}}]
+        }));
+
+        let context = context_from_openai_request(&request);
+        let parsed = parse_pseudo_tool_response(
+            &format!(
+                "{}<tool_call>{{\"action\":\"bash\",\"action_input\":{{\"command\":\"ls\"}}}}</tool_call>",
+                TOOL_CALL_SENTINEL
+            ),
+            &context,
+        )
+        .expect("sentinel with wrong tag should remain plain text");
+
+        match parsed {
+            ParsedPseudoToolResponse::Final { content } => {
+                assert!(content.contains(TOOL_CALL_SENTINEL));
+            }
+            ParsedPseudoToolResponse::Action { .. } => panic!("expected final text"),
+        }
     }
 
     #[test]

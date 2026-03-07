@@ -1935,11 +1935,12 @@ fn build_openai_assistant_message(
             tool_calls: None,
         },
         ParsedPseudoToolResponse::Action {
+            preamble_text,
             tool_name,
             action_input,
         } => AssistantMessage {
             role: "assistant",
-            content: String::new(),
+            content: preamble_text.clone().unwrap_or_default(),
             reasoning_content,
             tool_calls: Some(vec![build_openai_tool_call(tool_name, action_input, None)]),
         },
@@ -2057,9 +2058,31 @@ fn build_openai_buffered_stream_events(
             ));
         }
         ParsedPseudoToolResponse::Action {
+            preamble_text,
             tool_name,
             action_input,
         } => {
+            if let Some(text) = preamble_text.as_ref().filter(|text| !text.is_empty()) {
+                let content_chunk = ChatCompletionChunk {
+                    id: chat_id.to_string(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.to_string(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: None,
+                            content: Some(text.clone()),
+                            reasoning_content: None,
+                            tool_calls: None,
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                events.push(Ok(Event::default()
+                    .data(serde_json::to_string(&content_chunk).unwrap_or_default())));
+            }
+
             let tool_chunk = ChatCompletionChunk {
                 id: chat_id.to_string(),
                 object: "chat.completion.chunk",
@@ -2126,18 +2149,29 @@ fn build_claude_response(
             "end_turn",
         ),
         ParsedPseudoToolResponse::Action {
+            preamble_text,
             tool_name,
             action_input,
-        } => (
-            vec![ClaudeContentBlock {
+        } => {
+            let mut blocks = Vec::new();
+            if let Some(text) = preamble_text.as_ref().filter(|text| !text.is_empty()) {
+                blocks.push(ClaudeContentBlock {
+                    type_field: "text",
+                    text: Some(text.clone()),
+                    id: None,
+                    name: None,
+                    input: None,
+                });
+            }
+            blocks.push(ClaudeContentBlock {
                 type_field: "tool_use",
                 text: None,
                 id: Some(format!("toolu_{}", uuid::Uuid::new_v4().as_simple())),
                 name: Some(tool_name.clone()),
                 input: Some(action_input.clone()),
-            }],
-            "tool_use",
-        ),
+            });
+            (blocks, "tool_use")
+        }
     };
 
     ClaudeMessagesResponse {
@@ -2235,12 +2269,54 @@ fn build_claude_buffered_stream_events(
                 .data(serde_json::to_string(&message_delta).unwrap_or_default())));
         }
         ParsedPseudoToolResponse::Action {
+            preamble_text,
             tool_name,
             action_input,
         } => {
+            let mut next_index = 0;
+
+            if let Some(text) = preamble_text.as_ref().filter(|text| !text.is_empty()) {
+                let text_block_start = ClaudeStreamContentBlockStart {
+                    type_field: "content_block_start",
+                    index: next_index,
+                    content_block: ClaudeContentBlock {
+                        type_field: "text",
+                        text: Some(String::new()),
+                        id: None,
+                        name: None,
+                        input: None,
+                    },
+                };
+                events.push(Ok(Event::default()
+                    .event("content_block_start")
+                    .data(serde_json::to_string(&text_block_start).unwrap_or_default())));
+
+                let text_delta = ClaudeStreamContentBlockDelta {
+                    type_field: "content_block_delta",
+                    index: next_index,
+                    delta: ClaudeTextDelta {
+                        type_field: "text_delta",
+                        text: text.clone(),
+                    },
+                };
+                events.push(Ok(Event::default()
+                    .event("content_block_delta")
+                    .data(serde_json::to_string(&text_delta).unwrap_or_default())));
+
+                let text_block_stop = ClaudeStreamContentBlockStop {
+                    type_field: "content_block_stop",
+                    index: next_index,
+                };
+                events.push(Ok(Event::default()
+                    .event("content_block_stop")
+                    .data(serde_json::to_string(&text_block_stop).unwrap_or_default())));
+
+                next_index += 1;
+            }
+
             let block_start = ClaudeStreamContentBlockStart {
                 type_field: "content_block_start",
-                index: 0,
+                index: next_index,
                 content_block: ClaudeContentBlock {
                     type_field: "tool_use",
                     text: None,
@@ -2255,7 +2331,7 @@ fn build_claude_buffered_stream_events(
 
             let block_stop = ClaudeStreamContentBlockStop {
                 type_field: "content_block_stop",
-                index: 0,
+                index: next_index,
             };
             events.push(Ok(Event::default()
                 .event("content_block_stop")
@@ -2467,8 +2543,13 @@ async fn append_proxy_audit_record(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_cookie_failure, next_round_robin_offset, rotate_cookie_values};
+    use super::{
+        PseudoToolRunOutcome, build_claude_response, build_openai_assistant_message,
+        classify_cookie_failure, next_round_robin_offset, rotate_cookie_values,
+    };
     use crate::cookie_manager::CookieFailureKind;
+    use crate::pseudo_tools::ParsedPseudoToolResponse;
+    use serde_json::json;
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -2541,5 +2622,51 @@ mod tests {
         assert_eq!(next_round_robin_offset(&counter, 3), 1);
         assert_eq!(next_round_robin_offset(&counter, 3), 2);
         assert_eq!(next_round_robin_offset(&counter, 3), 0);
+    }
+
+    #[test]
+    fn openai_assistant_message_keeps_text_and_tool_call() {
+        let outcome = PseudoToolRunOutcome {
+            response: ParsedPseudoToolResponse::Action {
+                preamble_text: Some("I will check the directory first.".to_string()),
+                tool_name: "bash".to_string(),
+                action_input: json!({"command": "ls"}),
+            },
+            thinking: String::new(),
+        };
+
+        let message = build_openai_assistant_message(&outcome, false);
+        assert_eq!(message.content, "I will check the directory first.");
+        assert_eq!(
+            message.tool_calls.as_ref().map(|calls| calls.len()),
+            Some(1)
+        );
+        assert_eq!(
+            message.tool_calls.as_ref().unwrap()[0].function.name,
+            "bash"
+        );
+    }
+
+    #[test]
+    fn claude_response_keeps_text_and_tool_use() {
+        let outcome = PseudoToolRunOutcome {
+            response: ParsedPseudoToolResponse::Action {
+                preamble_text: Some("I will check the directory first.".to_string()),
+                tool_name: "bash".to_string(),
+                action_input: json!({"command": "ls"}),
+            },
+            thinking: String::new(),
+        };
+
+        let response = build_claude_response("claude-sonnet-4.5", 12, &outcome);
+        assert_eq!(response.stop_reason, "tool_use");
+        assert_eq!(response.content.len(), 2);
+        assert_eq!(response.content[0].type_field, "text");
+        assert_eq!(
+            response.content[0].text.as_deref(),
+            Some("I will check the directory first.")
+        );
+        assert_eq!(response.content[1].type_field, "tool_use");
+        assert_eq!(response.content[1].name.as_deref(), Some("bash"));
     }
 }
