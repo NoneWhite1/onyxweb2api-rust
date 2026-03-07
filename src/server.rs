@@ -26,12 +26,12 @@ use crate::{
     cookie_manager::{CookieFailureKind, CookieManager},
     models::{
         AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-        ChatMessage, Choice, ChunkChoice, ChunkDelta, ClaudeContentBlock, ClaudeMessagesRequest,
-        ClaudeMessagesResponse, ClaudeStopDelta, ClaudeStreamContentBlockDelta,
-        ClaudeStreamContentBlockStart, ClaudeStreamContentBlockStop, ClaudeStreamMessageDelta,
-        ClaudeStreamMessageMeta, ClaudeStreamMessageStart, ClaudeStreamMessageStop,
-        ClaudeTextDelta, ClaudeUsage, DEFAULT_MODEL, ModelItem, ModelsListResponse, Usage,
-        supported_models,
+        ChatMessage, Choice, ChunkChoice, ChunkDelta, ClaudeContentBlock, ClaudeInputJsonDelta,
+        ClaudeMessagesRequest, ClaudeMessagesResponse, ClaudeStopDelta,
+        ClaudeStreamContentBlockDelta, ClaudeStreamContentBlockStart, ClaudeStreamContentBlockStop,
+        ClaudeStreamMessageDelta, ClaudeStreamMessageMeta, ClaudeStreamMessageStart,
+        ClaudeStreamMessageStop, ClaudeTextDelta, ClaudeUsage, DEFAULT_MODEL, ModelItem,
+        ModelsListResponse, Usage, supported_models,
     },
     onyx_client::{self, StreamEvent},
     pseudo_tools::{self, ParsedPseudoToolResponse, ToolPromptContext, ValidationFailure},
@@ -1394,10 +1394,11 @@ async fn v1_messages_handler(
                                 let delta = ClaudeStreamContentBlockDelta {
                                     type_field: "content_block_delta",
                                     index: 0,
-                                    delta: ClaudeTextDelta {
+                                    delta: serde_json::to_value(ClaudeTextDelta {
                                         type_field: "text_delta",
                                         text,
-                                    },
+                                    })
+                                    .unwrap_or_else(|_| json!({})),
                                 };
                                 let data = serde_json::to_string(&delta).unwrap_or_default();
                                 let event =
@@ -2188,6 +2189,56 @@ fn build_claude_response(
     }
 }
 
+fn build_claude_tool_use_stream_payloads(
+    index: u8,
+    tool_use_id: &str,
+    tool_name: &str,
+    action_input: &serde_json::Value,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let block_start = ClaudeStreamContentBlockStart {
+        type_field: "content_block_start",
+        index,
+        content_block: ClaudeContentBlock {
+            type_field: "tool_use",
+            text: None,
+            id: Some(tool_use_id.to_string()),
+            name: Some(tool_name.to_string()),
+            input: Some(json!({})),
+        },
+    };
+
+    let input_delta = ClaudeStreamContentBlockDelta {
+        type_field: "content_block_delta",
+        index,
+        delta: serde_json::to_value(ClaudeInputJsonDelta {
+            type_field: "input_json_delta",
+            partial_json: serde_json::to_string(action_input)
+                .unwrap_or_else(|_| String::from("{}")),
+        })
+        .unwrap_or_else(|_| json!({})),
+    };
+
+    let block_stop = ClaudeStreamContentBlockStop {
+        type_field: "content_block_stop",
+        index,
+    };
+
+    vec![
+        (
+            "content_block_start",
+            serde_json::to_value(block_start).unwrap_or_else(|_| json!({})),
+        ),
+        (
+            "content_block_delta",
+            serde_json::to_value(input_delta).unwrap_or_else(|_| json!({})),
+        ),
+        (
+            "content_block_stop",
+            serde_json::to_value(block_stop).unwrap_or_else(|_| json!({})),
+        ),
+    ]
+}
+
 fn build_claude_buffered_stream_events(
     message_id: &str,
     model: &str,
@@ -2236,10 +2287,11 @@ fn build_claude_buffered_stream_events(
                 let delta = ClaudeStreamContentBlockDelta {
                     type_field: "content_block_delta",
                     index: 0,
-                    delta: ClaudeTextDelta {
+                    delta: serde_json::to_value(ClaudeTextDelta {
                         type_field: "text_delta",
                         text: content.clone(),
-                    },
+                    })
+                    .unwrap_or_else(|_| json!({})),
                 };
                 events.push(Ok(Event::default()
                     .event("content_block_delta")
@@ -2294,10 +2346,11 @@ fn build_claude_buffered_stream_events(
                 let text_delta = ClaudeStreamContentBlockDelta {
                     type_field: "content_block_delta",
                     index: next_index,
-                    delta: ClaudeTextDelta {
+                    delta: serde_json::to_value(ClaudeTextDelta {
                         type_field: "text_delta",
                         text: text.clone(),
-                    },
+                    })
+                    .unwrap_or_else(|_| json!({})),
                 };
                 events.push(Ok(Event::default()
                     .event("content_block_delta")
@@ -2314,28 +2367,17 @@ fn build_claude_buffered_stream_events(
                 next_index += 1;
             }
 
-            let block_start = ClaudeStreamContentBlockStart {
-                type_field: "content_block_start",
-                index: next_index,
-                content_block: ClaudeContentBlock {
-                    type_field: "tool_use",
-                    text: None,
-                    id: Some(format!("toolu_{}", uuid::Uuid::new_v4().as_simple())),
-                    name: Some(tool_name.clone()),
-                    input: Some(action_input.clone()),
-                },
-            };
-            events.push(Ok(Event::default()
-                .event("content_block_start")
-                .data(serde_json::to_string(&block_start).unwrap_or_default())));
-
-            let block_stop = ClaudeStreamContentBlockStop {
-                type_field: "content_block_stop",
-                index: next_index,
-            };
-            events.push(Ok(Event::default()
-                .event("content_block_stop")
-                .data(serde_json::to_string(&block_stop).unwrap_or_default())));
+            let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4().as_simple());
+            for (event_name, payload) in build_claude_tool_use_stream_payloads(
+                next_index,
+                &tool_use_id,
+                tool_name,
+                action_input,
+            ) {
+                events.push(Ok(Event::default()
+                    .event(event_name)
+                    .data(serde_json::to_string(&payload).unwrap_or_default())));
+            }
 
             let message_delta = ClaudeStreamMessageDelta {
                 type_field: "message_delta",
@@ -2544,8 +2586,9 @@ async fn append_proxy_audit_record(
 #[cfg(test)]
 mod tests {
     use super::{
-        PseudoToolRunOutcome, build_claude_response, build_openai_assistant_message,
-        classify_cookie_failure, next_round_robin_offset, rotate_cookie_values,
+        PseudoToolRunOutcome, build_claude_response, build_claude_tool_use_stream_payloads,
+        build_openai_assistant_message, classify_cookie_failure, next_round_robin_offset,
+        rotate_cookie_values,
     };
     use crate::cookie_manager::CookieFailureKind;
     use crate::pseudo_tools::ParsedPseudoToolResponse;
@@ -2668,5 +2711,39 @@ mod tests {
         );
         assert_eq!(response.content[1].type_field, "tool_use");
         assert_eq!(response.content[1].name.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn claude_tool_use_stream_payload_includes_input_json_delta() {
+        let payloads = build_claude_tool_use_stream_payloads(
+            0,
+            "toolu_123",
+            "bash",
+            &json!({
+                "command": "ls /home/nonewhite/Download/ 2>&1 || echo 'DIR_NOT_FOUND'",
+                "description": "Check if Download directory exists"
+            }),
+        );
+
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads[0].0, "content_block_start");
+        assert_eq!(payloads[1].0, "content_block_delta");
+        assert_eq!(payloads[2].0, "content_block_stop");
+
+        assert_eq!(payloads[0].1["content_block"]["type"], "tool_use");
+        assert_eq!(payloads[0].1["content_block"]["name"], "bash");
+        assert_eq!(payloads[0].1["content_block"]["input"], json!({}));
+
+        assert_eq!(payloads[1].1["delta"]["type"], "input_json_delta");
+        let partial_json = payloads[1].1["delta"]["partial_json"]
+            .as_str()
+            .expect("partial_json should be a string");
+        let parsed: serde_json::Value =
+            serde_json::from_str(partial_json).expect("partial_json should be valid JSON");
+        assert_eq!(
+            parsed["command"],
+            "ls /home/nonewhite/Download/ 2>&1 || echo 'DIR_NOT_FOUND'"
+        );
+        assert_eq!(parsed["description"], "Check if Download directory exists");
     }
 }

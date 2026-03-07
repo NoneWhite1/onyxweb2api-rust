@@ -639,7 +639,7 @@ pub struct ClaudeStreamContentBlockDelta {
     #[serde(rename = "type")]
     pub type_field: &'static str,
     pub index: u8,
-    pub delta: ClaudeTextDelta,
+    pub delta: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -647,6 +647,13 @@ pub struct ClaudeTextDelta {
     #[serde(rename = "type")]
     pub type_field: &'static str,
     pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClaudeInputJsonDelta {
+    #[serde(rename = "type")]
+    pub type_field: &'static str,
+    pub partial_json: String,
 }
 
 #[derive(Debug, Serialize)]
