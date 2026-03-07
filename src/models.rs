@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-4.6";
 
@@ -18,7 +19,26 @@ pub fn supported_models() -> Vec<&'static str> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default, deserialize_with = "deserialize_openai_message_content")]
     pub content: String,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<RequestAssistantToolCall>>,
+}
+
+impl ChatMessage {
+    pub fn system(content: String) -> Self {
+        Self {
+            role: "system".to_string(),
+            content,
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -72,6 +92,22 @@ impl ChatCompletionRequest {
                 }
             }
         }
+    }
+
+    pub fn has_tool_result_message(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.role.trim().eq_ignore_ascii_case("tool"))
+    }
+
+    pub fn has_assistant_tool_call_message(&self) -> bool {
+        self.messages.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .map(|tool_calls| !tool_calls.is_empty())
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -129,9 +165,7 @@ fn openai_tool_type_alias(tool_type: &str) -> Option<String> {
     let normalized = tool_type.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "code_interpreter" | "python" | "python_tool" => Some("python".to_string()),
-        "open_url" | "openurl" | "open_url_tool" | "openurltool" => {
-            Some("open_url".to_string())
-        }
+        "open_url" | "openurl" | "open_url_tool" | "openurltool" => Some("open_url".to_string()),
         _ => non_empty_trimmed(tool_type),
     }
 }
@@ -177,7 +211,7 @@ pub struct AssistantMessage {
     pub tool_calls: Option<Vec<AssistantToolCall>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssistantToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -187,8 +221,22 @@ pub struct AssistantToolCall {
     pub index: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssistantToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RequestAssistantToolCall {
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub function: RequestAssistantToolCallFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RequestAssistantToolCallFunction {
     pub name: String,
     pub arguments: String,
 }
@@ -283,7 +331,10 @@ impl ClaudeMessagesRequest {
                     .unwrap_or_default();
 
                 if kind.is_empty() || kind == "tool" {
-                    choice_obj.name.as_ref().and_then(|name| non_empty_trimmed(name))
+                    choice_obj
+                        .name
+                        .as_ref()
+                        .and_then(|name| non_empty_trimmed(name))
                 } else {
                     None
                 }
@@ -347,6 +398,55 @@ where
     }
 }
 
+fn deserialize_openai_message_content<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    let value = Option::<Value>::deserialize(d)?;
+    match value {
+        None => Ok(String::new()),
+        Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(s)) => Ok(s),
+        Some(Value::Array(arr)) => {
+            let text = extract_openai_text_from_parts(&arr);
+            Ok(text)
+        }
+        Some(Value::Object(obj)) => Ok(obj
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()),
+        Some(other) => Err(de::Error::custom(format!(
+            "content must be string, array, object, or null, got {other}"
+        ))),
+    }
+}
+
+fn extract_openai_text_from_parts(arr: &[Value]) -> String {
+    let mut parts = Vec::new();
+
+    for part in arr {
+        match part {
+            Value::String(s) if !s.is_empty() => parts.push(s.clone()),
+            Value::Object(obj) => {
+                let part_type = obj.get("type").and_then(Value::as_str).unwrap_or_default();
+                if part_type == "text" || part_type.is_empty() {
+                    if let Some(text) = obj.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    parts.join("\n")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeMessage {
     pub role: String,
@@ -394,8 +494,6 @@ fn extract_text_from_blocks(arr: &[serde_json::Value]) -> String {
 }
 
 fn extract_text_and_flags_from_blocks(arr: &[serde_json::Value]) -> (String, bool) {
-    use serde_json::Value;
-
     let mut parts = Vec::new();
     let mut has_tool_result = false;
 
@@ -407,37 +505,72 @@ fn extract_text_and_flags_from_blocks(arr: &[serde_json::Value]) -> (String, boo
             continue;
         }
 
-        if let Some("tool_result") = block.get("type").and_then(Value::as_str)
-            && let Some(content) = block.get("content")
-        {
+        if let Some("tool_result") = block.get("type").and_then(Value::as_str) {
             has_tool_result = true;
-            match content {
-                Value::String(s) if !s.is_empty() => parts.push(s.clone()),
-                Value::Array(nested) => {
-                    let (nested_text, nested_has_tool_result) = extract_text_and_flags_from_blocks(nested);
-                    has_tool_result |= nested_has_tool_result;
-                    if !nested_text.is_empty() {
-                        parts.push(nested_text);
-                    }
-                }
-                Value::Object(obj) => {
-                    if let Some(text) = obj.get("text").and_then(Value::as_str)
-                        && !text.is_empty()
-                    {
-                        parts.push(text.to_string());
-                    }
-                }
-                _ => {}
+
+            let tool_use_id = block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_tool_call");
+
+            let tool_result_text = block
+                .get("content")
+                .map(extract_text_from_value)
+                .unwrap_or_default();
+
+            if tool_result_text.is_empty() {
+                parts.push(format!("[tool_result id={tool_use_id}]"));
+            } else {
+                parts.push(format!(
+                    "[tool_result id={tool_use_id}]\n{tool_result_text}"
+                ));
             }
             continue;
         }
 
         if let Some("tool_use") = block.get("type").and_then(Value::as_str) {
+            let tool_id = block
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("tool_use_unknown");
+            let tool_name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let input_json = block
+                .get("input")
+                .map(compact_json_string)
+                .unwrap_or_else(|| "{}".to_string());
+            parts.push(format!(
+                "[assistant_tool_call id={tool_id} name={tool_name} input={input_json}]"
+            ));
             continue;
         }
     }
 
     (parts.join("\n"), has_tool_result)
+}
+
+fn extract_text_from_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => arr
+            .iter()
+            .map(extract_text_from_value)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                text.to_string()
+            } else {
+                compact_json_string(value)
+            }
+        }
+        _ => value.to_string(),
+    }
+}
+
+fn compact_json_string(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| String::from("{}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -561,7 +694,11 @@ mod tests {
         }))
         .expect("should deserialize ClaudeMessage");
 
-        assert!(msg.content.is_empty(), "tool_use should not be forwarded as prompt text");
+        assert!(
+            msg.content
+                .contains("[assistant_tool_call id=toolu_1 name=shell input={\"cmd\":\"pwd\"}]"),
+            "tool_use should be converted into a prompt marker"
+        );
         assert!(
             !msg.has_tool_result,
             "tool_use-only content should not mark tool_result presence"
@@ -584,7 +721,7 @@ mod tests {
         }))
         .expect("should deserialize ClaudeMessage");
 
-        assert_eq!(msg.content, "/home/nonewhite");
+        assert_eq!(msg.content, "[tool_result id=toolu_1]\n/home/nonewhite");
         assert!(
             msg.has_tool_result,
             "tool_result content should mark tool_result presence"
@@ -609,8 +746,8 @@ mod tests {
         .expect("should deserialize ClaudeMessage");
 
         assert!(
-            msg.content.is_empty(),
-            "non-text tool_result metadata should not be forwarded"
+            msg.content.contains("[tool_result id=toolu_1]"),
+            "tool_result metadata should preserve the tool_result marker"
         );
         assert!(
             msg.has_tool_result,

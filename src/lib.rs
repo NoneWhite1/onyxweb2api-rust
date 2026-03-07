@@ -2,6 +2,7 @@ pub mod config;
 pub mod cookie_manager;
 pub mod models;
 pub mod onyx_client;
+pub mod pseudo_tools;
 pub mod server;
 
 #[cfg(test)]
