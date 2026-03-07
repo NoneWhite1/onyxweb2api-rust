@@ -2691,6 +2691,20 @@ mod tests {
     }
 
     #[test]
+    fn openai_assistant_message_for_final_text_has_no_tool_calls() {
+        let outcome = PseudoToolRunOutcome {
+            response: ParsedPseudoToolResponse::Final {
+                content: "Done editing the file.".to_string(),
+            },
+            thinking: String::new(),
+        };
+
+        let message = build_openai_assistant_message(&outcome, false);
+        assert_eq!(message.content, "Done editing the file.");
+        assert!(message.tool_calls.is_none());
+    }
+
+    #[test]
     fn claude_response_keeps_text_and_tool_use() {
         let outcome = PseudoToolRunOutcome {
             response: ParsedPseudoToolResponse::Action {
@@ -2711,6 +2725,25 @@ mod tests {
         );
         assert_eq!(response.content[1].type_field, "tool_use");
         assert_eq!(response.content[1].name.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn claude_response_for_final_text_has_no_tool_use_block() {
+        let outcome = PseudoToolRunOutcome {
+            response: ParsedPseudoToolResponse::Final {
+                content: "Done editing the file.".to_string(),
+            },
+            thinking: String::new(),
+        };
+
+        let response = build_claude_response("claude-sonnet-4.5", 12, &outcome);
+        assert_eq!(response.stop_reason, "end_turn");
+        assert_eq!(response.content.len(), 1);
+        assert_eq!(response.content[0].type_field, "text");
+        assert_eq!(
+            response.content[0].text.as_deref(),
+            Some("Done editing the file.")
+        );
     }
 
     #[test]

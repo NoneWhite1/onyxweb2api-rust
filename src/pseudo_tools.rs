@@ -9,6 +9,7 @@ pub const MAX_PROTOCOL_RETRIES: usize = 3;
 pub const TOOL_CALL_SENTINEL: &str = "<<<ONYX_TOOL_CALL_9F4C2E7A6B1D8C3E5A0F7B2D4C6E8A1F>>>";
 pub const TOOL_CALL_OPEN_TAG: &str = "<onyx_tool_call_9f4c2e7a6b1d8c3e5a0f7b2d4c6e8a1f>";
 pub const TOOL_CALL_CLOSE_TAG: &str = "</onyx_tool_call_9f4c2e7a6b1d8c3e5a0f7b2d4c6e8a1f>";
+pub const NOOP_TOOL_ACTION: &str = "__proxy_noop__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolChoiceMode {
@@ -154,8 +155,9 @@ pub fn parse_pseudo_tool_response(
     }
 
     let Some(tool_call_block) = extract_tool_call_block(trimmed)? else {
-        return Ok(ParsedPseudoToolResponse::Final {
-            content: trimmed.to_string(),
+        return Err(ValidationFailure {
+            code: "MISSING_TOOL_TRAILER",
+            message: "response must end with the sentinel-prefixed tool trailer".to_string(),
         });
     };
 
@@ -176,7 +178,12 @@ pub fn parse_pseudo_tool_response(
     let has_action = object.contains_key("action");
 
     match (has_final, has_action) {
-        (true, false) => parse_final_response(&object),
+        (true, false) => Err(ValidationFailure {
+            code: "INVALID_TOOL_BLOCK",
+            message:
+                "tool trailer must use action/action_input; use the no-op action for final answers"
+                    .to_string(),
+        }),
         (false, true) => parse_action_response(&object, context, tool_call_block.preamble_text),
         (true, true) => Err(ValidationFailure {
             code: "AMBIGUOUS_OUTPUT",
@@ -377,7 +384,10 @@ fn build_protocol_prompt(context: &ToolPromptContext) -> String {
     }
 
     prompt.push_str("Response format rules:\n");
-    prompt.push_str("- For a normal answer, reply with plain text only.\n");
+    prompt.push_str(
+        "- Every response must end with exactly one sentinel-prefixed tagged trailer block.\n",
+    );
+    prompt.push_str("- If you are giving a normal answer without using a real tool, write the plain-text answer first and then append the no-op trailer block described below.\n");
     prompt.push_str("- For a tool call, you must emit exactly one sentinel-prefixed tagged block using this format and nothing else except optional plain-text narration before the sentinel:\n");
     prompt.push_str(&format!(
         "  {}\n  {}{{\"action\":\"tool_name\",\"action_input\":{{...}}}}{}\n",
@@ -385,6 +395,10 @@ fn build_protocol_prompt(context: &ToolPromptContext) -> String {
     ));
     prompt.push_str("- Do not emit a bare JSON tool call.\n");
     prompt.push_str("- Do not emit old or alternate tool_call tags.\n");
+    prompt.push_str(&format!(
+        "- For a normal non-tool answer, the trailing trailer block must be: {}{}{{\"action\":\"{}\",\"action_input\":{{\"status\":\"final\"}}}}{}\n",
+        TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, NOOP_TOOL_ACTION, TOOL_CALL_CLOSE_TAG
+    ));
 
     if context.tools.is_empty() {
         prompt.push_str("No tools are available for this request.\n");
@@ -406,45 +420,23 @@ fn build_protocol_prompt(context: &ToolPromptContext) -> String {
         }
     }
 
-    prompt.push_str("\nIf prior tool results are present in the conversation, use them. After receiving a tool result, either call another tool with the sentinel-prefixed format above or answer in plain text. Never repeat a previous invalid output.\n");
+    prompt.push_str("\nIf prior tool results are present in the conversation, use them. After receiving a tool result, either call another real tool with the sentinel-prefixed format above or answer in plain text followed by the required no-op trailer block. Never repeat a previous invalid output.\n");
     prompt
 }
 
 fn build_retry_prompt(failure: &ValidationFailure) -> String {
     format!(
-        "Your previous response was discarded. Failure code: {}. Failure reason: {}. Retry now. Use plain text for a final answer, or use exactly this sentinel-prefixed tool-call format for a tool call: {}{}{{\"action\":\"tool_name\",\"action_input\":{{...}}}}{}",
-        failure.code, failure.message, TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, TOOL_CALL_CLOSE_TAG,
+        "Your previous response was discarded. Failure code: {}. Failure reason: {}. Retry now. Every response must end with one sentinel-prefixed trailer block. For a normal answer, append {}{}{{\"action\":\"{}\",\"action_input\":{{\"status\":\"final\"}}}}{}. For a real tool call, append {}{}{{\"action\":\"tool_name\",\"action_input\":{{...}}}}{}",
+        failure.code,
+        failure.message,
+        TOOL_CALL_SENTINEL,
+        TOOL_CALL_OPEN_TAG,
+        NOOP_TOOL_ACTION,
+        TOOL_CALL_CLOSE_TAG,
+        TOOL_CALL_SENTINEL,
+        TOOL_CALL_OPEN_TAG,
+        TOOL_CALL_CLOSE_TAG,
     )
-}
-
-fn parse_final_response(
-    object: &serde_json::Map<String, Value>,
-) -> Result<ParsedPseudoToolResponse, ValidationFailure> {
-    if object.len() != 1 {
-        return Err(ValidationFailure {
-            code: "DIRTY_JSON",
-            message: "final response may only contain the 'final' field".to_string(),
-        });
-    }
-
-    let Some(final_text) = object.get("final").and_then(Value::as_str) else {
-        return Err(ValidationFailure {
-            code: "INVALID_FINAL",
-            message: "final must be a string".to_string(),
-        });
-    };
-
-    let final_text = final_text.trim();
-    if final_text.is_empty() {
-        return Err(ValidationFailure {
-            code: "EMPTY_FINAL",
-            message: "final must not be empty".to_string(),
-        });
-    }
-
-    Ok(ParsedPseudoToolResponse::Final {
-        content: final_text.to_string(),
-    })
 }
 
 fn parse_action_response(
@@ -471,6 +463,20 @@ fn parse_action_response(
         return Err(ValidationFailure {
             code: "INVALID_ACTION",
             message: "action must not be empty".to_string(),
+        });
+    }
+
+    if action_name == NOOP_TOOL_ACTION {
+        let final_text = preamble_text.unwrap_or_default().trim().to_string();
+        if final_text.is_empty() {
+            return Err(ValidationFailure {
+                code: "EMPTY_FINAL",
+                message: "no-op trailer requires preceding final text".to_string(),
+            });
+        }
+
+        return Ok(ParsedPseudoToolResponse::Final {
+            content: final_text,
         });
     }
 
@@ -666,9 +672,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ParsedPseudoToolResponse, TOOL_CALL_CLOSE_TAG, TOOL_CALL_OPEN_TAG, TOOL_CALL_SENTINEL,
-        ToolChoiceMode, context_from_openai_request, parse_pseudo_tool_response,
-        should_enable_openai_protocol,
+        NOOP_TOOL_ACTION, ParsedPseudoToolResponse, TOOL_CALL_CLOSE_TAG, TOOL_CALL_OPEN_TAG,
+        TOOL_CALL_SENTINEL, ToolChoiceMode, context_from_openai_request,
+        parse_pseudo_tool_response, should_enable_openai_protocol,
     };
     use crate::models::{ChatCompletionRequest, ChatMessage};
 
@@ -746,7 +752,13 @@ mod tests {
 
         let context = context_from_openai_request(&request);
         let parsed = parse_pseudo_tool_response(
-            "This is an example JSON snippet: {\"action\":\"search_docs\",\"action_input\":{}}",
+            &format!(
+                "This is an example JSON snippet: {{\"action\":\"search_docs\",\"action_input\":{{}}}}\n{}{}{{\"action\":\"{}\",\"action_input\":{{\"status\":\"final\"}}}}{}",
+                TOOL_CALL_SENTINEL,
+                TOOL_CALL_OPEN_TAG,
+                NOOP_TOOL_ACTION,
+                TOOL_CALL_CLOSE_TAG
+            ),
             &context,
         )
         .expect("plain text should stay plain text");
@@ -804,22 +816,16 @@ mod tests {
         }));
 
         let context = context_from_openai_request(&request);
-        let parsed = parse_pseudo_tool_response(
+        let err = parse_pseudo_tool_response(
             &format!(
                 "Example format: {}{}{{\"action\":\"bash\",\"action_input\":{{\"command\":\"ls\"}}}}{} and then continue explaining.",
                 TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, TOOL_CALL_CLOSE_TAG
             ),
             &context,
         )
-        .expect("non-tail tagged block should remain plain text");
+        .expect_err("non-tail tagged block should fail validation");
 
-        match parsed {
-            ParsedPseudoToolResponse::Final { content } => {
-                assert!(content.contains("Example format:"));
-                assert!(content.contains("and then continue explaining."));
-            }
-            ParsedPseudoToolResponse::Action { .. } => panic!("expected final text"),
-        }
+        assert_eq!(err.code, "MISSING_TOOL_TRAILER");
     }
 
     #[test]
@@ -893,18 +899,13 @@ mod tests {
         }));
 
         let context = context_from_openai_request(&request);
-        let parsed = parse_pseudo_tool_response(
+        let err = parse_pseudo_tool_response(
             "Here is an example only: <tool_call>{\"action\":\"bash\",\"action_input\":{\"command\":\"ls\"}}</tool_call>",
             &context,
         )
-        .expect("old tag without sentinel should remain plain text");
+        .expect_err("missing sentinel trailer should fail validation");
 
-        match parsed {
-            ParsedPseudoToolResponse::Final { content } => {
-                assert!(content.contains("<tool_call>"));
-            }
-            ParsedPseudoToolResponse::Action { .. } => panic!("expected final text"),
-        }
+        assert_eq!(err.code, "MISSING_TOOL_TRAILER");
     }
 
     #[test]
@@ -916,18 +917,42 @@ mod tests {
         }));
 
         let context = context_from_openai_request(&request);
-        let parsed = parse_pseudo_tool_response(
+        let err = parse_pseudo_tool_response(
             &format!(
                 "{}<tool_call>{{\"action\":\"bash\",\"action_input\":{{\"command\":\"ls\"}}}}</tool_call>",
                 TOOL_CALL_SENTINEL
             ),
             &context,
         )
-        .expect("sentinel with wrong tag should remain plain text");
+        .expect_err("wrong tag with sentinel should fail validation");
+
+        assert_eq!(err.code, "MISSING_TOOL_TRAILER");
+    }
+
+    #[test]
+    fn parses_noop_trailer_as_final_text() {
+        let request = build_request(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "bash"}}]
+        }));
+
+        let context = context_from_openai_request(&request);
+        let parsed = parse_pseudo_tool_response(
+            &format!(
+                "The file has been updated successfully.\n{}{}{{\"action\":\"{}\",\"action_input\":{{\"status\":\"final\"}}}}{}",
+                TOOL_CALL_SENTINEL,
+                TOOL_CALL_OPEN_TAG,
+                NOOP_TOOL_ACTION,
+                TOOL_CALL_CLOSE_TAG
+            ),
+            &context,
+        )
+        .expect("noop trailer should parse as final text");
 
         match parsed {
             ParsedPseudoToolResponse::Final { content } => {
-                assert!(content.contains(TOOL_CALL_SENTINEL));
+                assert_eq!(content, "The file has been updated successfully.");
             }
             ParsedPseudoToolResponse::Action { .. } => panic!("expected final text"),
         }
