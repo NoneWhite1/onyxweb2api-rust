@@ -931,6 +931,7 @@ async fn v1_chat_completions_handler(
         .await
         {
             Ok((content, thinking)) => {
+                let content = pseudo_tools::strip_noop_trailer(&content).unwrap_or(content);
                 let mut cm = state.cookie_manager.write().await;
                 cm.mark_call_success(&cookie);
                 cm.save();
@@ -944,7 +945,7 @@ async fn v1_chat_completions_handler(
                         index: 0,
                         message: AssistantMessage {
                             role: "assistant",
-                            content,
+                            content: Some(content),
                             reasoning_content: if include_reasoning && !thinking.is_empty() {
                                 Some(thinking)
                             } else {
@@ -1485,26 +1486,30 @@ async fn v1_messages_handler(
         .await
         {
             Ok((content, _thinking)) => {
+                let content = pseudo_tools::strip_noop_trailer(&content).unwrap_or(content);
                 let mut cm = state.cookie_manager.write().await;
                 cm.mark_call_success(cookie);
                 cm.save();
+
+                let content_blocks = vec![ClaudeContentBlock {
+                    type_field: "text",
+                    text: Some(content),
+                    id: None,
+                    name: None,
+                    input: None,
+                }];
+                let output_tokens = estimate_claude_output_tokens(&content_blocks);
 
                 let response = ClaudeMessagesResponse {
                     id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
                     type_field: "message",
                     role: "assistant",
-                    content: vec![ClaudeContentBlock {
-                        type_field: "text",
-                        text: Some(content),
-                        id: None,
-                        name: None,
-                        input: None,
-                    }],
+                    content: content_blocks,
                     model: model.clone(),
                     stop_reason: "end_turn",
                     usage: ClaudeUsage {
                         input_tokens,
-                        output_tokens: 0,
+                        output_tokens,
                     },
                 };
                 let response_json = json!(response);
@@ -1931,7 +1936,7 @@ fn build_openai_assistant_message(
     match &outcome.response {
         ParsedPseudoToolResponse::Final { content } => AssistantMessage {
             role: "assistant",
-            content: content.clone(),
+            content: Some(content.clone()),
             reasoning_content,
             tool_calls: None,
         },
@@ -1941,7 +1946,7 @@ fn build_openai_assistant_message(
             action_input,
         } => AssistantMessage {
             role: "assistant",
-            content: preamble_text.clone().unwrap_or_default(),
+            content: preamble_text.clone(),
             reasoning_content,
             tool_calls: Some(vec![build_openai_tool_call(tool_name, action_input, None)]),
         },
@@ -2175,6 +2180,8 @@ fn build_claude_response(
         }
     };
 
+    let output_tokens = estimate_claude_output_tokens(&content);
+
     ClaudeMessagesResponse {
         id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
         type_field: "message",
@@ -2184,8 +2191,34 @@ fn build_claude_response(
         stop_reason,
         usage: ClaudeUsage {
             input_tokens,
-            output_tokens: 0,
+            output_tokens,
         },
+    }
+}
+
+fn estimate_claude_output_tokens(content: &[ClaudeContentBlock]) -> u32 {
+    let mut chars = 0usize;
+
+    for block in content {
+        chars += match block.type_field {
+            "text" => block.text.as_deref().map(str::len).unwrap_or(0),
+            "tool_use" => {
+                let name_len = block.name.as_deref().map(str::len).unwrap_or(0);
+                let input_len = block
+                    .input
+                    .as_ref()
+                    .map(|value| value.to_string().len())
+                    .unwrap_or(0);
+                name_len + input_len
+            }
+            _ => 0,
+        };
+    }
+
+    if chars == 0 {
+        0
+    } else {
+        ((chars / 4) as u32).max(1)
     }
 }
 
@@ -2679,7 +2712,10 @@ mod tests {
         };
 
         let message = build_openai_assistant_message(&outcome, false);
-        assert_eq!(message.content, "I will check the directory first.");
+        assert_eq!(
+            message.content.as_deref(),
+            Some("I will check the directory first.")
+        );
         assert_eq!(
             message.tool_calls.as_ref().map(|calls| calls.len()),
             Some(1)
@@ -2700,8 +2736,31 @@ mod tests {
         };
 
         let message = build_openai_assistant_message(&outcome, false);
-        assert_eq!(message.content, "Done editing the file.");
+        assert_eq!(message.content.as_deref(), Some("Done editing the file."));
         assert!(message.tool_calls.is_none());
+    }
+
+    #[test]
+    fn openai_assistant_message_without_preamble_uses_null_content_for_tool_call() {
+        let outcome = PseudoToolRunOutcome {
+            response: ParsedPseudoToolResponse::Action {
+                preamble_text: None,
+                tool_name: "bash".to_string(),
+                action_input: json!({"command": "ls"}),
+            },
+            thinking: String::new(),
+        };
+
+        let message = build_openai_assistant_message(&outcome, false);
+        assert_eq!(message.content, None);
+        assert_eq!(
+            message.tool_calls.as_ref().map(|calls| calls.len()),
+            Some(1)
+        );
+        assert_eq!(
+            message.tool_calls.as_ref().unwrap()[0].function.name,
+            "bash"
+        );
     }
 
     #[test]
@@ -2725,6 +2784,7 @@ mod tests {
         );
         assert_eq!(response.content[1].type_field, "tool_use");
         assert_eq!(response.content[1].name.as_deref(), Some("bash"));
+        assert!(response.usage.output_tokens > 0);
     }
 
     #[test]
@@ -2744,6 +2804,7 @@ mod tests {
             response.content[0].text.as_deref(),
             Some("Done editing the file.")
         );
+        assert!(response.usage.output_tokens > 0);
     }
 
     #[test]

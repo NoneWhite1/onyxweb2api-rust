@@ -10,6 +10,7 @@ pub const TOOL_CALL_SENTINEL: &str = "<<<ONYX_TOOL_CALL_9F4C2E7A6B1D8C3E5A0F7B2D
 pub const TOOL_CALL_OPEN_TAG: &str = "<onyx_tool_call_9f4c2e7a6b1d8c3e5a0f7b2d4c6e8a1f>";
 pub const TOOL_CALL_CLOSE_TAG: &str = "</onyx_tool_call_9f4c2e7a6b1d8c3e5a0f7b2d4c6e8a1f>";
 pub const NOOP_TOOL_ACTION: &str = "__proxy_noop__";
+pub const LEGACY_NOOP_TOOL_ACTION: &str = "proxy_noop";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolChoiceMode {
@@ -193,6 +194,20 @@ pub fn parse_pseudo_tool_response(
             code: "MISSING_FIELDS",
             message: "response must contain either 'final' or 'action'".to_string(),
         }),
+    }
+}
+
+pub fn strip_noop_trailer(raw_text: &str) -> Option<String> {
+    let trimmed = raw_text.trim();
+    let tool_call_block = extract_tool_call_block(trimmed).ok()??;
+    let candidate = serde_json::from_str::<Value>(&tool_call_block.json).ok()?;
+    let object = candidate.as_object()?;
+    let action_name = object.get("action")?.as_str()?.trim();
+
+    if is_noop_action(action_name) {
+        Some(tool_call_block.preamble_text.unwrap_or_default())
+    } else {
+        None
     }
 }
 
@@ -466,7 +481,7 @@ fn parse_action_response(
         });
     }
 
-    if action_name == NOOP_TOOL_ACTION {
+    if is_noop_action(action_name) {
         let final_text = preamble_text.unwrap_or_default().trim().to_string();
         if final_text.is_empty() {
             return Err(ValidationFailure {
@@ -529,6 +544,10 @@ fn parse_action_response(
         tool_name: action_name.to_string(),
         action_input: action_input.clone(),
     })
+}
+
+fn is_noop_action(action_name: &str) -> bool {
+    action_name == NOOP_TOOL_ACTION || action_name == LEGACY_NOOP_TOOL_ACTION
 }
 
 fn validate_schema_subset(value: &Value, schema: &Value) -> Result<(), ValidationFailure> {
@@ -672,9 +691,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        NOOP_TOOL_ACTION, ParsedPseudoToolResponse, TOOL_CALL_CLOSE_TAG, TOOL_CALL_OPEN_TAG,
-        TOOL_CALL_SENTINEL, ToolChoiceMode, context_from_openai_request,
-        parse_pseudo_tool_response, should_enable_openai_protocol,
+        LEGACY_NOOP_TOOL_ACTION, NOOP_TOOL_ACTION, ParsedPseudoToolResponse, TOOL_CALL_CLOSE_TAG,
+        TOOL_CALL_OPEN_TAG, TOOL_CALL_SENTINEL, ToolChoiceMode, context_from_openai_request,
+        parse_pseudo_tool_response, should_enable_openai_protocol, strip_noop_trailer,
     };
     use crate::models::{ChatCompletionRequest, ChatMessage};
 
@@ -956,6 +975,26 @@ mod tests {
             }
             ParsedPseudoToolResponse::Action { .. } => panic!("expected final text"),
         }
+    }
+
+    #[test]
+    fn strip_noop_trailer_removes_current_noop_marker() {
+        let stripped = strip_noop_trailer(&format!(
+            "Done.\n{}{}{{\"action\":\"{}\",\"action_input\":{{\"status\":\"final\"}}}}{}",
+            TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, NOOP_TOOL_ACTION, TOOL_CALL_CLOSE_TAG
+        ));
+
+        assert_eq!(stripped.as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn strip_noop_trailer_removes_legacy_noop_marker() {
+        let stripped = strip_noop_trailer(&format!(
+            "Done.\n{}{}{{\"action\":\"{}\",\"action_input\":{{\"status\":\"final\"}}}}{}",
+            TOOL_CALL_SENTINEL, TOOL_CALL_OPEN_TAG, LEGACY_NOOP_TOOL_ACTION, TOOL_CALL_CLOSE_TAG
+        ));
+
+        assert_eq!(stripped.as_deref(), Some("Done."));
     }
 
     #[test]
