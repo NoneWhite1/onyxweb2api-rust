@@ -2,11 +2,11 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
-use serde_json::Value;
 use rust_proxy::{
     config::Settings,
     server::{build_router, build_state},
 };
+use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::util::ServiceExt;
 
@@ -58,7 +58,12 @@ async fn health_endpoint_returns_ok() {
     let app = test_router();
 
     let response = app
-        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -186,7 +191,9 @@ async fn add_cookie_endpoint_returns_ok() {
                 .method("POST")
                 .uri("/api/cookies")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"cookie":"fastapiusersauth=added-cookie-1"}"#))
+                .body(Body::from(
+                    r#"{"cookie":"fastapiusersauth=added-cookie-1"}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -334,8 +341,14 @@ async fn auth_login_page_returns_html() {
         .await
         .unwrap();
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("Get Cookie"), "login page should contain title");
-    assert!(text.contains("loginForm"), "login page should contain login form");
+    assert!(
+        text.contains("Get Cookie"),
+        "login page should contain title"
+    );
+    assert!(
+        text.contains("loginForm"),
+        "login page should contain login form"
+    );
 }
 
 #[tokio::test]
@@ -716,12 +729,15 @@ async fn claude_messages_audit_log_captures_raw_request_body() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
     let audit = tokio::fs::read_to_string(&audit_path)
         .await
         .expect("audit file should exist");
-    let last = audit.lines().last().expect("audit log should contain one line");
+    let last = audit
+        .lines()
+        .last()
+        .expect("audit log should contain one line");
     let json: Value = serde_json::from_str(last).expect("audit record should be valid json");
     assert_eq!(json["endpoint"], "/v1/messages");
     assert_eq!(json["raw_request_body"], raw_body);
@@ -754,8 +770,8 @@ async fn claude_messages_streaming() {
 }
 
 #[tokio::test]
-async fn claude_messages_streaming_local_tool_use_returns_tool_use_events() {
-    let app = test_router();
+async fn claude_messages_with_tools_do_not_return_local_tool_use_when_upstream_fails() {
+    let app = test_router_with_invalid_upstream();
 
     let response = app
         .oneshot(
@@ -777,49 +793,33 @@ async fn claude_messages_streaming_local_tool_use_returns_tool_use_events() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
     let body = to_bytes(response.into_body(), 65536).await.unwrap();
-    let sse = String::from_utf8_lossy(&body);
-
-    assert!(sse.contains("event: message_start"), "missing message_start event: {sse}");
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let message = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        sse.contains("\"type\":\"tool_use\""),
-        "missing tool_use content block: {sse}"
+        message.contains("upstream failure:"),
+        "expected upstream failure, got: {json}"
     );
-    assert!(sse.contains("\"name\":\"bash\""), "missing bash tool name: {sse}");
-    assert!(
-        sse.contains("\"type\":\"input_json_delta\""),
-        "missing input_json_delta for tool input: {sse}"
-    );
-    assert!(
-        sse.contains("\\\"command\\\":\\\"pwd\\\""),
-        "missing tool input command in input_json_delta: {sse}"
-    );
-    assert!(
-        sse.contains("\"stop_reason\":\"tool_use\""),
-        "missing tool_use stop reason: {sse}"
-    );
-    assert!(sse.contains("event: message_stop"), "missing message_stop event: {sse}");
 }
 
 #[tokio::test]
-async fn claude_messages_streaming_write_tool_use_for_english_create_file_prompt() {
-    let app = test_router();
+async fn chat_completions_with_tools_do_not_return_local_tool_calls_when_upstream_fails() {
+    let app = test_router_with_invalid_upstream();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/messages")
+                .uri("/v1/chat/completions")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{
-                        "model":"claude-opus-4.6",
-                        "messages":[{"role":"user","content":"Please create 1234.txt with content 1234"}],
-                        "tools":[{"name":"write","description":"write file","input_schema":{"type":"object"}}],
-                        "max_tokens":1024,
-                        "stream":true
+                        "model":"gpt-4o",
+                        "messages":[{"role":"user","content":"Use the bash tool to run: pwd"}],
+                        "tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object"}}}],
+                        "stream":false
                     }"#,
                 ))
                 .unwrap(),
@@ -827,135 +827,13 @@ async fn claude_messages_streaming_write_tool_use_for_english_create_file_prompt
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
     let body = to_bytes(response.into_body(), 65536).await.unwrap();
-    let sse = String::from_utf8_lossy(&body);
-
-    assert!(sse.contains("event: message_start"), "missing message_start event: {sse}");
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let message = json["error"].as_str().unwrap_or_default();
     assert!(
-        sse.contains("\"type\":\"tool_use\""),
-        "missing tool_use content block: {sse}"
-    );
-    assert!(sse.contains("\"name\":\"write\""), "missing write tool name: {sse}");
-    assert!(
-        sse.contains("\"type\":\"input_json_delta\""),
-        "missing input_json_delta for write tool input: {sse}"
-    );
-    assert!(
-        sse.contains("\\\"filePath\\\":\\\"1234.txt\\\""),
-        "missing expected filePath in input_json_delta: {sse}"
-    );
-    assert!(
-        sse.contains("\\\"content\\\":\\\"1234\\\""),
-        "missing expected content in input_json_delta: {sse}"
-    );
-    assert!(
-        sse.contains("\"stop_reason\":\"tool_use\""),
-        "missing tool_use stop reason: {sse}"
-    );
-    assert!(sse.contains("event: message_stop"), "missing message_stop event: {sse}");
-}
-
-#[tokio::test]
-async fn claude_messages_streaming_prefers_write_when_bash_and_write_both_available() {
-    let app = test_router();
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{
-                        "model":"claude-opus-4.6",
-                        "messages":[{"role":"user","content":"Please create 1234.txt with content 1234"}],
-                        "tools":[
-                            {"name":"bash","description":"run shell","input_schema":{"type":"object"}},
-                            {"name":"write","description":"write file","input_schema":{"type":"object"}}
-                        ],
-                        "max_tokens":1024,
-                        "stream":true
-                    }"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = to_bytes(response.into_body(), 65536).await.unwrap();
-    let sse = String::from_utf8_lossy(&body);
-
-    assert!(
-        sse.contains("\"type\":\"tool_use\""),
-        "missing tool_use content block: {sse}"
-    );
-    assert!(
-        sse.contains("\"name\":\"write\""),
-        "expected write tool when both write and bash available: {sse}"
-    );
-    assert!(
-        !sse.contains("\"name\":\"bash\""),
-        "should not pick bash for this create-file prompt when write is available: {sse}"
-    );
-    assert!(
-        sse.contains("\"stop_reason\":\"tool_use\""),
-        "missing tool_use stop reason: {sse}"
-    );
-}
-
-#[tokio::test]
-async fn claude_messages_streaming_write_tool_use_emits_input_json_delta_for_chinese_prompt() {
-    let app = test_router();
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{
-                        "model":"claude-opus-4.6",
-                        "messages":[{"role":"user","content":"帮我创建个文件名字为1234.txt写入1234内容。"}],
-                        "tools":[{"name":"write","description":"write file","input_schema":{"type":"object"}}],
-                        "max_tokens":1024,
-                        "stream":true
-                    }"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = to_bytes(response.into_body(), 65536).await.unwrap();
-    let sse = String::from_utf8_lossy(&body);
-
-    assert!(sse.contains("\"type\":\"tool_use\""), "missing tool_use block: {sse}");
-    assert!(sse.contains("\"name\":\"write\""), "missing write name: {sse}");
-    assert!(
-        sse.contains("\"type\":\"input_json_delta\""),
-        "missing input_json_delta event: {sse}"
-    );
-    assert!(
-        sse.contains("\"partial_json\":\"{\\\""),
-        "missing serialized partial_json payload in input_json_delta: {sse}"
-    );
-    assert!(
-        sse.contains("\\\"filePath\\\":\\\"1234.txt\\\""),
-        "missing filePath in input_json_delta payload: {sse}"
-    );
-    assert!(
-        sse.contains("\\\"content\\\":\\\"1234内容。\\\""),
-        "missing content in input_json_delta payload: {sse}"
-    );
-    assert!(
-        sse.contains("\"stop_reason\":\"tool_use\""),
-        "missing tool_use stop reason: {sse}"
+        message.contains("upstream failure:"),
+        "expected upstream failure, got: {json}"
     );
 }

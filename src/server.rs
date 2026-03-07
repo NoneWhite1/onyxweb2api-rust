@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    body::Bytes,
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{Html, IntoResponse, Sse, sse::Event},
@@ -25,16 +25,16 @@ use crate::{
     config::Settings,
     cookie_manager::{CookieFailureKind, CookieManager},
     models::{
-        AssistantMessage, AssistantToolCall, AssistantToolCallFunction, ChatCompletionChunk,
-        ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, ChunkChoice,
-        ChunkDelta, ClaudeContentBlock,
-        ClaudeMessagesRequest, ClaudeMessagesResponse, ClaudeStreamContentBlockDelta,
-        ClaudeStreamContentBlockStart, ClaudeStreamContentBlockStop,
-        ClaudeStreamMessageDelta, ClaudeStreamMessageStart, ClaudeStreamMessageStop,
-        ClaudeStreamMessageMeta, ClaudeStopDelta, ClaudeTextDelta, ClaudeUsage,
-        ModelItem, ModelsListResponse, Usage, DEFAULT_MODEL, supported_models,
+        AssistantMessage, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+        ChatMessage, Choice, ChunkChoice, ChunkDelta, ClaudeContentBlock, ClaudeMessagesRequest,
+        ClaudeMessagesResponse, ClaudeStopDelta, ClaudeStreamContentBlockDelta,
+        ClaudeStreamContentBlockStart, ClaudeStreamContentBlockStop, ClaudeStreamMessageDelta,
+        ClaudeStreamMessageMeta, ClaudeStreamMessageStart, ClaudeStreamMessageStop,
+        ClaudeTextDelta, ClaudeUsage, DEFAULT_MODEL, ModelItem, ModelsListResponse, Usage,
+        supported_models,
     },
     onyx_client::{self, StreamEvent},
+    pseudo_tools::{self, ParsedPseudoToolResponse, ToolPromptContext, ValidationFailure},
 };
 
 #[derive(Clone)]
@@ -91,7 +91,9 @@ struct ProxyAuditRecord {
 
 pub fn build_state(settings: Settings) -> anyhow::Result<AppState> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(settings.request_timeout_secs))
+        .timeout(std::time::Duration::from_secs(
+            settings.request_timeout_secs,
+        ))
         .build()?;
 
     Ok(AppState {
@@ -147,10 +149,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/models", get(v1_models_handler))
         .route("/v1/chat/completions", post(v1_chat_completions_handler))
         .route("/v1/messages", post(v1_messages_handler))
-        .route("/api/cookies", get(cookies_handler).post(add_cookie_handler))
+        .route(
+            "/api/cookies",
+            get(cookies_handler).post(add_cookie_handler),
+        )
         .route("/api/cookies/{fingerprint}", delete(delete_cookie_handler))
         .route("/api/cookies/refresh", post(refresh_cookies_handler))
-        .route("/auth/login", get(auth_login_page_handler).post(auth_login_handler))
+        .route(
+            "/auth/login",
+            get(auth_login_page_handler).post(auth_login_handler),
+        )
         .with_state(state)
 }
 
@@ -642,189 +650,45 @@ async fn v1_chat_completions_handler(
             .into_response();
     }
 
-    let request_log = serde_json::to_value(&req).unwrap_or_else(|_| json!({"error":"request_serialize_failed"}));
+    let request_log =
+        serde_json::to_value(&req).unwrap_or_else(|_| json!({"error":"request_serialize_failed"}));
+    let chat_messages = pseudo_tools::normalize_openai_messages(&req.messages);
+    let tool_context = pseudo_tools::context_from_openai_request(&req);
+    let uses_pseudo_tool_protocol =
+        pseudo_tools::should_enable_openai_protocol(&req, &tool_context);
 
-    let requested_tool_names = req.requested_tool_names();
-    let forced_tool_name = req.forced_tool_name();
+    if uses_pseudo_tool_protocol {
+        let model = req
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let include_reasoning = req.include_reasoning.unwrap_or(true);
 
-    if let Some(tool_call) = maybe_build_local_tool_call_from_chat_request(&req) {
         if req.stream.unwrap_or(false) {
-            let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-            let created = now_ts();
-            let model = req.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string());
-            let tool_call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
-
-            let sse_stream = stream::unfold(0u8, move |phase| {
-                let chat_id = chat_id.clone();
-                let model = model.clone();
-                let tool_call_id = tool_call_id.clone();
-                let tool_name = tool_call.name.clone();
-                let tool_args = tool_call.arguments.clone();
-                async move {
-                    match phase {
-                        0 => {
-                            // Chunk 1: Role and initial tool call block
-                            let chunk = ChatCompletionChunk {
-                                id: chat_id,
-                                object: "chat.completion.chunk",
-                                created,
-                                model,
-                                choices: vec![ChunkChoice {
-                                    index: 0,
-                                    delta: ChunkDelta {
-                                        role: Some("assistant"),
-                                        content: None,
-                                        reasoning_content: None,
-                                        tool_calls: Some(vec![AssistantToolCall {
-                                            id: tool_call_id,
-                                            kind: "function",
-                                            function: AssistantToolCallFunction {
-                                                name: tool_name,
-                                                arguments: String::new(),
-                                            },
-                                            index: Some(0),
-                                        }]),
-                                    },
-                                    finish_reason: None,
-                                }],
-                            };
-                            let event = Event::default().data(serde_json::to_string(&chunk).unwrap());
-                            Some((Ok::<_, Infallible>(event), 1))
-                        }
-                        1 => {
-                            // Chunk 2: Arguments delta
-                            let chunk = ChatCompletionChunk {
-                                id: chat_id,
-                                object: "chat.completion.chunk",
-                                created,
-                                model,
-                                choices: vec![ChunkChoice {
-                                    index: 0,
-                                    delta: ChunkDelta {
-                                        role: None,
-                                        content: None,
-                                        reasoning_content: None,
-                                        tool_calls: Some(vec![AssistantToolCall {
-                                            id: String::new(), // ID only required in first chunk
-                                            kind: "function",
-                                            function: AssistantToolCallFunction {
-                                                name: String::new(),
-                                                arguments: tool_args,
-                                            },
-                                            index: Some(0),
-                                        }]),
-                                    },
-                                    finish_reason: None,
-                                }],
-                            };
-                            let event = Event::default().data(serde_json::to_string(&chunk).unwrap());
-                            Some((Ok::<_, Infallible>(event), 2))
-                        }
-                        2 => {
-                            // Chunk 3: Stop reason
-                            let chunk = ChatCompletionChunk {
-                                id: chat_id,
-                                object: "chat.completion.chunk",
-                                created,
-                                model,
-                                choices: vec![ChunkChoice {
-                                    index: 0,
-                                    delta: ChunkDelta { role: None, content: None, reasoning_content: None, tool_calls: None },
-                                    finish_reason: Some("tool_calls"),
-                                }],
-                            };
-                            let event = Event::default().data(serde_json::to_string(&chunk).unwrap());
-                            Some((Ok::<_, Infallible>(event), 99))
-                        }
-                        _ => None,
-                    }
-                }
-            });
-            return Sse::new(sse_stream).into_response();
-        } else {
-            let response = ChatCompletionResponse {
-                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                object: "chat.completion",
-                created: now_ts(),
-                model: req.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-                choices: vec![Choice {
-                    index: 0,
-                    message: AssistantMessage {
-                        role: "assistant",
-                        content: String::new(), // Should ideally be None, but kept for minimal change if Serialize allows empty string. Standard is null.
-                        reasoning_content: None,
-                        tool_calls: Some(vec![AssistantToolCall {
-                            id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-                            kind: "function",
-                            function: AssistantToolCallFunction {
-                                name: tool_call.name,
-                                arguments: tool_call.arguments,
-                            },
-                            index: Some(0),
-                        }]),
-                    },
-                    finish_reason: "tool_calls",
-                }],
-                usage: Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            };
-            let response_json = json!(response);
-            append_proxy_audit_record(
-                &state.settings,
-                "/v1/chat/completions",
-                &request_log,
-                Some(&raw_request_body),
-                StatusCode::OK,
-                &response_json,
+            return openai_pseudo_tool_stream_response(
+                headers,
+                state,
+                raw_request_body,
+                request_log,
+                chat_messages,
+                tool_context,
+                model,
+                include_reasoning,
             )
             .await;
-            return (StatusCode::OK, Json(response_json)).into_response();
         }
-        }
-    if !req.stream.unwrap_or(false)
-        && let Some(tool_call) = maybe_build_local_tool_call_from_chat_request(&req)
-    {
-        let response = ChatCompletionResponse {
-            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-            object: "chat.completion",
-            created: now_ts(),
-            model: req.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            choices: vec![Choice {
-                index: 0,
-                message: AssistantMessage {
-                    role: "assistant",
-                    content: String::new(),
-                    reasoning_content: None,
-                    tool_calls: Some(vec![AssistantToolCall {
-                        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
-                        kind: "function",
-                        function: AssistantToolCallFunction {
-                            name: tool_call.name,
-                            arguments: tool_call.arguments,
-                        },
-                        index: Some(0),
-                    }]),
-                },
-                finish_reason: "tool_calls",
-            }],
-            usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            },
-        };
 
-        let response_json = json!(response);
-        append_proxy_audit_record(
-            &state.settings,
-            "/v1/chat/completions",
-            &request_log,
-            Some(&raw_request_body),
-            StatusCode::OK,
-            &response_json,
+        return openai_pseudo_tool_non_stream_response(
+            headers,
+            state,
+            raw_request_body,
+            request_log,
+            chat_messages,
+            tool_context,
+            model,
+            include_reasoning,
         )
         .await;
-
-        return (StatusCode::OK, Json(response_json)).into_response();
     }
 
     if req.stream.unwrap_or(false) {
@@ -844,11 +708,7 @@ async fn v1_chat_completions_handler(
                 &response_json,
             )
             .await;
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(response_json),
-            )
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, Json(response_json)).into_response();
         }
 
         let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -861,43 +721,12 @@ async fn v1_chat_completions_handler(
         let mut _success_cookie: Option<String> = None;
 
         for cookie in &cookie_values {
-            let (allowed_tool_ids, forced_tool_id) =
-                match resolve_tool_selection_for_cookie(
-                    &state.http_client,
-                    &state.settings,
-                    cookie,
-                    &requested_tool_names,
-                    forced_tool_name.as_deref(),
-                )
-                .await
-                {
-                    Ok(selection) => selection,
-                    Err(err) => {
-                        let err_msg = onyx_client::format_error_chain(&err);
-                        let cookie_fp = crate::cookie_manager::fingerprint(cookie);
-                        error!(
-                            endpoint = "/v1/chat/completions",
-                            mode = "stream",
-                            cookie = %cookie_fp,
-                            error = %err_msg,
-                            "tool translation failed"
-                        );
-                        let mut cm = state.cookie_manager.write().await;
-                        mark_cookie_failure(&mut cm, cookie, err_msg.clone());
-                        cm.save();
-                        last_err = err_msg;
-                        continue;
-                    }
-                };
-
             match onyx_client::streaming_chat(
                 &state.http_client,
                 &state.settings,
                 cookie,
                 &req.messages,
                 &model,
-                allowed_tool_ids.as_deref(),
-                forced_tool_id,
             )
             .await
             {
@@ -938,11 +767,7 @@ async fn v1_chat_completions_handler(
                 &response_json,
             )
             .await;
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(response_json),
-            )
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, Json(response_json)).into_response();
         };
 
         append_proxy_audit_record(
@@ -957,7 +782,14 @@ async fn v1_chat_completions_handler(
 
         // Build SSE stream from the mpsc receiver
         let sse_stream = stream::unfold(
-            (rx, chat_id, model_for_stream, created, include_reasoning, false),
+            (
+                rx,
+                chat_id,
+                model_for_stream,
+                created,
+                include_reasoning,
+                false,
+            ),
             |(mut rx, chat_id, model, created, include_reasoning, done)| async move {
                 if done {
                     return None;
@@ -983,7 +815,10 @@ async fn v1_chat_completions_handler(
                         };
                         let data = serde_json::to_string(&chunk).unwrap_or_default();
                         let event = Event::default().data(data);
-                        Some((Ok::<_, Infallible>(event), (rx, chat_id, model, created, include_reasoning, false)))
+                        Some((
+                            Ok::<_, Infallible>(event),
+                            (rx, chat_id, model, created, include_reasoning, false),
+                        ))
                     }
                     Some(StreamEvent::Reasoning(text)) => {
                         if !include_reasoning {
@@ -1011,7 +846,10 @@ async fn v1_chat_completions_handler(
                         };
                         let data = serde_json::to_string(&chunk).unwrap_or_default();
                         let event = Event::default().data(data);
-                        Some((Ok::<_, Infallible>(event), (rx, chat_id, model, created, include_reasoning, false)))
+                        Some((
+                            Ok::<_, Infallible>(event),
+                            (rx, chat_id, model, created, include_reasoning, false),
+                        ))
                     }
                     Some(StreamEvent::Content(text)) => {
                         let chunk = ChatCompletionChunk {
@@ -1032,7 +870,10 @@ async fn v1_chat_completions_handler(
                         };
                         let data = serde_json::to_string(&chunk).unwrap_or_default();
                         let event = Event::default().data(data);
-                        Some((Ok::<_, Infallible>(event), (rx, chat_id, model, created, include_reasoning, false)))
+                        Some((
+                            Ok::<_, Infallible>(event),
+                            (rx, chat_id, model, created, include_reasoning, false),
+                        ))
                     }
                     Some(StreamEvent::Done) | None => {
                         let chunk = ChatCompletionChunk {
@@ -1053,7 +894,10 @@ async fn v1_chat_completions_handler(
                         };
                         let data = serde_json::to_string(&chunk).unwrap_or_default();
                         let stop_event = Event::default().data(data);
-                        Some((Ok::<_, Infallible>(stop_event), (rx, chat_id, model, created, include_reasoning, true)))
+                        Some((
+                            Ok::<_, Infallible>(stop_event),
+                            (rx, chat_id, model, created, include_reasoning, true),
+                        ))
                     }
                 }
             },
@@ -1077,44 +921,15 @@ async fn v1_chat_completions_handler(
 
     let mut last_err = String::from("unknown upstream error");
     for cookie in cookie_values {
-        let (allowed_tool_ids, forced_tool_id) = match resolve_tool_selection_for_cookie(
-            &state.http_client,
-            &state.settings,
-            &cookie,
-            &requested_tool_names,
-            forced_tool_name.as_deref(),
-        )
-        .await
-        {
-            Ok(selection) => selection,
-            Err(err) => {
-                let err_msg = onyx_client::format_error_chain(&err);
-                let cookie_fp = crate::cookie_manager::fingerprint(&cookie);
-                error!(
-                    endpoint = "/v1/chat/completions",
-                    mode = "non_stream",
-                    cookie = %cookie_fp,
-                    error = %err_msg,
-                    "tool translation failed"
-                );
-                let mut cm = state.cookie_manager.write().await;
-                mark_cookie_failure(&mut cm, &cookie, err_msg.clone());
-                cm.save();
-                last_err = err_msg;
-                continue;
-            }
-        };
-
         match onyx_client::full_chat(
             &state.http_client,
             &state.settings,
             &cookie,
             &req.messages,
             &model,
-            allowed_tool_ids.as_deref(),
-            forced_tool_id,
         )
-        .await {
+        .await
+        {
             Ok((content, thinking)) => {
                 let mut cm = state.cookie_manager.write().await;
                 cm.mark_call_success(&cookie);
@@ -1186,11 +1001,7 @@ async fn v1_chat_completions_handler(
         &response_json,
     )
     .await;
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(response_json),
-    )
-        .into_response()
+    (StatusCode::BAD_GATEWAY, Json(response_json)).into_response()
 }
 
 async fn cookies_handler(
@@ -1357,7 +1168,8 @@ async fn v1_messages_handler(
             .into_response();
     }
 
-    let request_log = serde_json::to_value(&req).unwrap_or_else(|_| json!({"error":"request_serialize_failed"}));
+    let request_log =
+        serde_json::to_value(&req).unwrap_or_else(|_| json!({"error":"request_serialize_failed"}));
 
     // Convert Claude messages to our internal ChatMessage format
     let mut chat_messages: Vec<ChatMessage> = Vec::new();
@@ -1365,17 +1177,9 @@ async fn v1_messages_handler(
         chat_messages.push(ChatMessage {
             role: "system".to_string(),
             content: sys.clone(),
-        });
-    }
-
-    // When tools are present, inject tool definitions as a system instruction
-    let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
-    if has_tools {
-        let tools = req.tools.as_ref().unwrap();
-        let tool_instruction = build_tool_injection_prompt(tools);
-        chat_messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: tool_instruction,
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
         });
     }
 
@@ -1383,12 +1187,17 @@ async fn v1_messages_handler(
         chat_messages.push(ChatMessage {
             role: m.role.clone(),
             content: m.content.clone(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
         });
     }
 
     let model = req.model.clone();
-    let requested_tool_names = req.requested_tool_names();
-    let forced_tool_name = req.forced_tool_name();
+
+    let tool_context = pseudo_tools::context_from_claude_request(&req);
+    let uses_pseudo_tool_protocol =
+        pseudo_tools::should_enable_claude_protocol(&req, &tool_context);
 
     // Estimate input tokens (rough estimation: 1 token ~= 4 chars)
     let input_tokens = {
@@ -1399,154 +1208,39 @@ async fn v1_messages_handler(
         (chars / 4) as u32 + 10 // +10 for structural overhead
     };
 
-    if req.stream.unwrap_or(false)
-        && let Some(tool_call) = maybe_build_local_tool_call_from_claude_request(&req)
-    {
-        let tool_input: serde_json::Value =
-            serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
-        let tool_input_json = serde_json::to_string(&tool_input).unwrap_or_else(|_| "{}".to_string());
-        let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
-        let model_for_stream = model.clone();
-        let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
-        let tool_name = tool_call.name;
-
-        let sse_stream = stream::unfold(0u8, move |phase| {
-            let msg_id = msg_id.clone();
-            let model = model_for_stream.clone();
-            let tool_use_id = tool_use_id.clone();
-            let tool_name = tool_name.clone();
-            let tool_input_json = tool_input_json.clone();
-            async move {
-                match phase {
-                    0 => {
-                        let start = ClaudeStreamMessageStart {
-                            type_field: "message_start",
-                            message: ClaudeStreamMessageMeta {
-                                id: msg_id,
-                                type_field: "message",
-                                role: "assistant",
-                                content: vec![],
-                                model,
-                                stop_reason: None,
-                                usage: ClaudeUsage {
-                                    input_tokens,
-                                    output_tokens: 0,
-                                },
-                            },
-                        };
-                        let data = serde_json::to_string(&start).unwrap_or_default();
-                        let event = Event::default().event("message_start").data(data);
-                        Some((Ok::<_, Infallible>(event), 1))
-                    }
-                    1 => {
-                        let block_start = ClaudeStreamContentBlockStart {
-                            type_field: "content_block_start",
-                            index: 0,
-                            content_block: ClaudeContentBlock {
-                                type_field: "tool_use",
-                                text: None,
-                                id: Some(tool_use_id),
-                                name: Some(tool_name),
-                                input: Some(json!({})),
-                            },
-                        };
-                        let data = serde_json::to_string(&block_start).unwrap_or_default();
-                        let event = Event::default().event("content_block_start").data(data);
-                        Some((Ok::<_, Infallible>(event), 2))
-                    }
-                    2 => {
-                        let data = serde_json::to_string(&json!({
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": tool_input_json,
-                            }
-                        }))
-                        .unwrap_or_default();
-                        let event = Event::default().event("content_block_delta").data(data);
-                        Some((Ok::<_, Infallible>(event), 3))
-                    }
-                    3 => {
-                        let block_stop = ClaudeStreamContentBlockStop {
-                            type_field: "content_block_stop",
-                            index: 0,
-                        };
-                        let data = serde_json::to_string(&block_stop).unwrap_or_default();
-                        let event = Event::default().event("content_block_stop").data(data);
-                        Some((Ok::<_, Infallible>(event), 4))
-                    }
-                    4 => {
-                        let msg_delta = ClaudeStreamMessageDelta {
-                            type_field: "message_delta",
-                            delta: ClaudeStopDelta {
-                                stop_reason: "tool_use",
-                            },
-                            usage: ClaudeUsage {
-                                input_tokens,
-                                output_tokens: 0,
-                            },
-                        };
-                        let data = serde_json::to_string(&msg_delta).unwrap_or_default();
-                        let event = Event::default().event("message_delta").data(data);
-                        Some((Ok::<_, Infallible>(event), 5))
-                    }
-                    5 => {
-                        let stop = ClaudeStreamMessageStop {
-                            type_field: "message_stop",
-                        };
-                        let data = serde_json::to_string(&stop).unwrap_or_default();
-                        let event = Event::default().event("message_stop").data(data);
-                        Some((Ok::<_, Infallible>(event), 99))
-                    }
-                    _ => None,
-                }
-            }
-        });
-
-        return Sse::new(sse_stream).into_response();
-    }
-
-    if !req.stream.unwrap_or(false)
-        && let Some(tool_call) = maybe_build_local_tool_call_from_claude_request(&req)
-    {
-        let tool_input: serde_json::Value =
-            serde_json::from_str(&tool_call.arguments).unwrap_or_else(|_| json!({}));
-        let response = ClaudeMessagesResponse {
-            id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
-            type_field: "message",
-            role: "assistant",
-            content: vec![ClaudeContentBlock {
-                type_field: "tool_use",
-                text: None,
-                id: Some(format!("toolu_{}", uuid::Uuid::new_v4().simple())),
-                name: Some(tool_call.name),
-                input: Some(tool_input),
-            }],
-            model: model.clone(),
-            stop_reason: "tool_use",
-            usage: ClaudeUsage {
+    if uses_pseudo_tool_protocol {
+        if req.stream.unwrap_or(false) {
+            return claude_pseudo_tool_stream_response(
+                headers,
+                state,
+                raw_request_body,
+                request_log,
+                chat_messages,
+                tool_context,
+                model,
                 input_tokens,
-                output_tokens: 0,
-            },
-        };
-        let response_json = json!(response);
-        append_proxy_audit_record(
-            &state.settings,
-            "/v1/messages",
-            &request_log,
-            Some(&raw_request_body),
-            StatusCode::OK,
-            &response_json,
+            )
+            .await;
+        }
+
+        return claude_pseudo_tool_non_stream_response(
+            headers,
+            state,
+            raw_request_body,
+            request_log,
+            chat_messages,
+            tool_context,
+            model,
+            input_tokens,
         )
         .await;
-        return (StatusCode::OK, Json(response_json)).into_response();
     }
 
     let cookie_values = active_cookie_values_round_robin(&state).await;
 
     if cookie_values.is_empty() {
-        let response_json = json!({"type":"error","error":{"type":"api_error","message":"no cookies configured"}});
+        let response_json =
+            json!({"type":"error","error":{"type":"api_error","message":"no cookies configured"}});
         append_proxy_audit_record(
             &state.settings,
             "/v1/messages",
@@ -1556,33 +1250,11 @@ async fn v1_messages_handler(
             &response_json,
         )
         .await;
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(response_json),
-        )
-            .into_response();
+        return (StatusCode::BAD_GATEWAY, Json(response_json)).into_response();
     }
 
     // ----- Streaming mode -----
     if req.stream.unwrap_or(false) {
-        // When tools are present, use full_chat + post-process to detect tool_calls.
-        // This sacrifices streaming latency but ensures reliable tool_call detection.
-        if has_tools {
-            append_proxy_audit_record(
-                &state.settings,
-                "/v1/messages",
-                &request_log,
-                Some(&raw_request_body),
-                StatusCode::OK,
-                &json!({"stream":true,"status":"started","mode":"tool-aware"}),
-            )
-            .await;
-            return claude_stream_with_tools(
-                &state, &cookie_values, &chat_messages, &model,
-                &requested_tool_names, forced_tool_name.as_deref(), input_tokens,
-            ).await;
-        }
-
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
         let model_for_stream = model.clone();
 
@@ -1590,43 +1262,12 @@ async fn v1_messages_handler(
         let mut rx_opt: Option<tokio::sync::mpsc::Receiver<StreamEvent>> = None;
 
         for cookie in &cookie_values {
-            let (allowed_tool_ids, forced_tool_id) =
-                match resolve_tool_selection_for_cookie(
-                    &state.http_client,
-                    &state.settings,
-                    cookie,
-                    &requested_tool_names,
-                    forced_tool_name.as_deref(),
-                )
-                .await
-                {
-                    Ok(selection) => selection,
-                    Err(err) => {
-                        let err_msg = onyx_client::format_error_chain(&err);
-                        let cookie_fp = crate::cookie_manager::fingerprint(cookie);
-                        error!(
-                            endpoint = "/v1/messages",
-                            mode = "stream",
-                            cookie = %cookie_fp,
-                            error = %err_msg,
-                            "tool translation failed"
-                        );
-                        let mut cm = state.cookie_manager.write().await;
-                        mark_cookie_failure(&mut cm, cookie, err_msg.clone());
-                        cm.save();
-                        last_err = err_msg;
-                        continue;
-                    }
-                };
-
             match onyx_client::streaming_chat(
                 &state.http_client,
                 &state.settings,
                 cookie,
                 &chat_messages,
                 &model,
-                allowed_tool_ids.as_deref(),
-                forced_tool_id,
             )
             .await
             {
@@ -1666,11 +1307,7 @@ async fn v1_messages_handler(
                 &response_json,
             )
             .await;
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(response_json),
-            )
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, Json(response_json)).into_response();
         };
 
         append_proxy_audit_record(
@@ -1687,7 +1324,15 @@ async fn v1_messages_handler(
         // State: (rx, msg_id, model, phase, output_tokens, input_tokens, buffer)
         // phase: 0=message_start, 1=content_block_start, 2=streaming, 3=content_block_stop, 4=message_delta, 5=message_stop
         let sse_stream = stream::unfold(
-            (rx, msg_id, model_for_stream, 0u8, 0u32, input_tokens, None::<StreamEvent>),
+            (
+                rx,
+                msg_id,
+                model_for_stream,
+                0u8,
+                0u32,
+                input_tokens,
+                None::<StreamEvent>,
+            ),
             |(mut rx, msg_id, model, phase, output_tokens, input_tokens, mut event_buffer)| async move {
                 match phase {
                     0 => {
@@ -1709,7 +1354,10 @@ async fn v1_messages_handler(
                         };
                         let data = serde_json::to_string(&start).unwrap_or_default();
                         let event = Event::default().event("message_start").data(data);
-                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 1, output_tokens, input_tokens, None)))
+                        Some((
+                            Ok::<_, Infallible>(event),
+                            (rx, msg_id, model, 1, output_tokens, input_tokens, None),
+                        ))
                     }
                     1 => {
                         // Emit content_block_start
@@ -1726,7 +1374,10 @@ async fn v1_messages_handler(
                         };
                         let data = serde_json::to_string(&block_start).unwrap_or_default();
                         let event = Event::default().event("content_block_start").data(data);
-                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens, input_tokens, None)))
+                        Some((
+                            Ok::<_, Infallible>(event),
+                            (rx, msg_id, model, 2, output_tokens, input_tokens, None),
+                        ))
                     }
                     2 => {
                         // Streaming content_block_delta
@@ -1737,7 +1388,8 @@ async fn v1_messages_handler(
                         };
 
                         match event {
-                            Some(StreamEvent::Content(text)) | Some(StreamEvent::Reasoning(text)) => {
+                            Some(StreamEvent::Content(text))
+                            | Some(StreamEvent::Reasoning(text)) => {
                                 let new_tokens = output_tokens + 1;
                                 let delta = ClaudeStreamContentBlockDelta {
                                     type_field: "content_block_delta",
@@ -1748,13 +1400,21 @@ async fn v1_messages_handler(
                                     },
                                 };
                                 let data = serde_json::to_string(&delta).unwrap_or_default();
-                                let event = Event::default().event("content_block_delta").data(data);
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, new_tokens, input_tokens, None)))
+                                let event =
+                                    Event::default().event("content_block_delta").data(data);
+                                Some((
+                                    Ok::<_, Infallible>(event),
+                                    (rx, msg_id, model, 2, new_tokens, input_tokens, None),
+                                ))
                             }
                             Some(StreamEvent::Role) => {
                                 // Skip role event, stay in phase 2 and recv again
-                                let event = Event::default().event("ping").data("{\"type\":\"ping\"}");
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 2, output_tokens, input_tokens, None)))
+                                let event =
+                                    Event::default().event("ping").data("{\"type\":\"ping\"}");
+                                Some((
+                                    Ok::<_, Infallible>(event),
+                                    (rx, msg_id, model, 2, output_tokens, input_tokens, None),
+                                ))
                             }
                             Some(StreamEvent::Done) | None => {
                                 // Transition to content_block_stop
@@ -1764,7 +1424,10 @@ async fn v1_messages_handler(
                                 };
                                 let data = serde_json::to_string(&block_stop).unwrap_or_default();
                                 let event = Event::default().event("content_block_stop").data(data);
-                                Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 4, output_tokens, input_tokens, None)))
+                                Some((
+                                    Ok::<_, Infallible>(event),
+                                    (rx, msg_id, model, 4, output_tokens, input_tokens, None),
+                                ))
                             }
                         }
                     }
@@ -1782,7 +1445,10 @@ async fn v1_messages_handler(
                         };
                         let data = serde_json::to_string(&msg_delta).unwrap_or_default();
                         let event = Event::default().event("message_delta").data(data);
-                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 5, output_tokens, input_tokens, None)))
+                        Some((
+                            Ok::<_, Infallible>(event),
+                            (rx, msg_id, model, 5, output_tokens, input_tokens, None),
+                        ))
                     }
                     5 => {
                         // Emit message_stop
@@ -1791,7 +1457,10 @@ async fn v1_messages_handler(
                         };
                         let data = serde_json::to_string(&stop).unwrap_or_default();
                         let event = Event::default().event("message_stop").data(data);
-                        Some((Ok::<_, Infallible>(event), (rx, msg_id, model, 99, output_tokens, input_tokens, None)))
+                        Some((
+                            Ok::<_, Infallible>(event),
+                            (rx, msg_id, model, 99, output_tokens, input_tokens, None),
+                        ))
                     }
                     _ => None, // terminal
                 }
@@ -1805,42 +1474,12 @@ async fn v1_messages_handler(
     let mut last_err = String::from("unknown upstream error");
 
     for cookie in &cookie_values {
-        let (allowed_tool_ids, forced_tool_id) = match resolve_tool_selection_for_cookie(
-            &state.http_client,
-            &state.settings,
-            cookie,
-            &requested_tool_names,
-            forced_tool_name.as_deref(),
-        )
-        .await
-        {
-            Ok(selection) => selection,
-            Err(err) => {
-                let err_msg = onyx_client::format_error_chain(&err);
-                let cookie_fp = crate::cookie_manager::fingerprint(cookie);
-                error!(
-                    endpoint = "/v1/messages",
-                    mode = "non_stream",
-                    cookie = %cookie_fp,
-                    error = %err_msg,
-                    "tool translation failed"
-                );
-                let mut cm = state.cookie_manager.write().await;
-                mark_cookie_failure(&mut cm, cookie, err_msg.clone());
-                cm.save();
-                last_err = err_msg;
-                continue;
-            }
-        };
-
         match onyx_client::full_chat(
             &state.http_client,
             &state.settings,
             cookie,
             &chat_messages,
             &model,
-            allowed_tool_ids.as_deref(),
-            forced_tool_id,
         )
         .await
         {
@@ -1848,60 +1487,6 @@ async fn v1_messages_handler(
                 let mut cm = state.cookie_manager.write().await;
                 cm.mark_call_success(cookie);
                 cm.save();
-
-                // Check for tool_calls in the response text
-                let (tool_calls, remaining_text) = if has_tools {
-                    onyx_client::extract_tool_calls_from_text(&content)
-                } else {
-                    (vec![], content.clone())
-                };
-
-                if !tool_calls.is_empty() {
-                    // Build content blocks: optional text block + tool_use blocks
-                    let mut blocks = Vec::new();
-                    if !remaining_text.is_empty() {
-                        blocks.push(ClaudeContentBlock {
-                            type_field: "text",
-                            text: Some(remaining_text),
-                            id: None,
-                            name: None,
-                            input: None,
-                        });
-                    }
-                    for tc in &tool_calls {
-                        blocks.push(ClaudeContentBlock {
-                            type_field: "tool_use",
-                            text: None,
-                            id: Some(format!("toolu_{}", uuid::Uuid::new_v4().simple())),
-                            name: Some(tc.name.clone()),
-                            input: Some(tc.arguments.clone()),
-                        });
-                    }
-
-        let response = ClaudeMessagesResponse {
-                        id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
-                        type_field: "message",
-                        role: "assistant",
-                        content: blocks,
-                        model: model.clone(),
-                        stop_reason: "tool_use",
-                        usage: ClaudeUsage {
-                            input_tokens,
-                            output_tokens: 0,
-                        },
-                    };
-                    let response_json = json!(response);
-                    append_proxy_audit_record(
-                        &state.settings,
-                        "/v1/messages",
-                        &request_log,
-                        Some(&raw_request_body),
-                        StatusCode::OK,
-                        &response_json,
-                    )
-                    .await;
-                    return (StatusCode::OK, Json(response_json)).into_response();
-                }
 
                 let response = ClaudeMessagesResponse {
                     id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
@@ -1962,200 +1547,643 @@ async fn v1_messages_handler(
         &response_json,
     )
     .await;
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(response_json),
-    )
-        .into_response()
+    (StatusCode::BAD_GATEWAY, Json(response_json)).into_response()
 }
 
-/// Build a system prompt that instructs the LLM to use `<tool_call>` markers.
-fn build_tool_injection_prompt(tools: &[crate::models::ClaudeToolDefinition]) -> String {
-    let mut s = String::from(
-        "You have access to the following tools. When you need to use a tool, you MUST respond with a tool call in this EXACT format (including the XML tags):\n\n\
-         <tool_call>\n\
-         {\"name\": \"tool_name\", \"arguments\": {\"param1\": \"value1\"}}\n\
-         </tool_call>\n\n\
-         You can make multiple tool calls by using multiple <tool_call> blocks.\n\
-         If you don't need to use any tool, respond normally with text.\n\
-         IMPORTANT: Always use the <tool_call> tags, never call tools in any other format.\n\n\
-         Available tools:\n",
-    );
+#[derive(Debug, Clone)]
+struct PseudoToolRunOutcome {
+    response: ParsedPseudoToolResponse,
+    thinking: String,
+}
 
-    for tool in tools {
-        s.push_str(&format!("- {}", tool.name));
-        if let Some(desc) = &tool.description {
-            s.push_str(&format!(": {}", desc));
-        }
-        s.push('\n');
-        if let Some(schema) = &tool.input_schema {
-            s.push_str(&format!("  Parameters: {}\n", schema));
-        }
+async fn openai_pseudo_tool_non_stream_response(
+    _headers: HeaderMap,
+    state: AppState,
+    raw_request_body: String,
+    request_log: serde_json::Value,
+    chat_messages: Vec<ChatMessage>,
+    tool_context: ToolPromptContext,
+    model: String,
+    include_reasoning: bool,
+) -> axum::response::Response {
+    let cookie_values = active_cookie_values_round_robin(&state).await;
+    if cookie_values.is_empty() {
+        let response_json = json!({"error":"no cookies configured"});
+        append_proxy_audit_record(
+            &state.settings,
+            "/v1/chat/completions",
+            &request_log,
+            Some(&raw_request_body),
+            StatusCode::BAD_GATEWAY,
+            &response_json,
+        )
+        .await;
+        return (StatusCode::BAD_GATEWAY, Json(response_json)).into_response();
     }
 
-    s
+    match run_pseudo_tool_protocol(
+        &state,
+        &cookie_values,
+        &chat_messages,
+        &tool_context,
+        &model,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let finish_reason = match outcome.response {
+                ParsedPseudoToolResponse::Final { .. } => "stop",
+                ParsedPseudoToolResponse::Action { .. } => "tool_calls",
+            };
+
+            let message = build_openai_assistant_message(&outcome, include_reasoning);
+            let response = ChatCompletionResponse {
+                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                object: "chat.completion",
+                created: now_ts(),
+                model,
+                choices: vec![Choice {
+                    index: 0,
+                    message,
+                    finish_reason,
+                }],
+                usage: Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+            };
+            let response_json = json!(response);
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/chat/completions",
+                &request_log,
+                Some(&raw_request_body),
+                StatusCode::OK,
+                &response_json,
+            )
+            .await;
+            (StatusCode::OK, Json(response_json)).into_response()
+        }
+        Err(last_err) => {
+            let response_json = json!({"error": format!("upstream failure: {last_err}")});
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/chat/completions",
+                &request_log,
+                Some(&raw_request_body),
+                StatusCode::BAD_GATEWAY,
+                &response_json,
+            )
+            .await;
+            (StatusCode::BAD_GATEWAY, Json(response_json)).into_response()
+        }
+    }
 }
 
-/// Handle Claude streaming requests when tools are present.
-/// Collects the full response via `full_chat()`, parses tool_calls,
-/// then emits SSE events in the correct Claude streaming format.
-async fn claude_stream_with_tools(
+async fn openai_pseudo_tool_stream_response(
+    _headers: HeaderMap,
+    state: AppState,
+    raw_request_body: String,
+    request_log: serde_json::Value,
+    chat_messages: Vec<ChatMessage>,
+    tool_context: ToolPromptContext,
+    model: String,
+    include_reasoning: bool,
+) -> axum::response::Response {
+    let cookie_values = active_cookie_values_round_robin(&state).await;
+    if cookie_values.is_empty() {
+        let response_json = json!({"error":"no cookies configured"});
+        append_proxy_audit_record(
+            &state.settings,
+            "/v1/chat/completions",
+            &request_log,
+            Some(&raw_request_body),
+            StatusCode::BAD_GATEWAY,
+            &response_json,
+        )
+        .await;
+        return (StatusCode::BAD_GATEWAY, Json(response_json)).into_response();
+    }
+
+    match run_pseudo_tool_protocol(
+        &state,
+        &cookie_values,
+        &chat_messages,
+        &tool_context,
+        &model,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/chat/completions",
+                &request_log,
+                Some(&raw_request_body),
+                StatusCode::OK,
+                &json!({"stream":true,"status":"started","pseudo_tool_protocol":true}),
+            )
+            .await;
+
+            let chat_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+            let created = now_ts();
+            let events = build_openai_buffered_stream_events(
+                &chat_id,
+                &model,
+                created,
+                include_reasoning,
+                &outcome,
+            );
+            Sse::new(stream::iter(events)).into_response()
+        }
+        Err(last_err) => {
+            let response_json = json!({"error": format!("upstream failure: {last_err}")});
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/chat/completions",
+                &request_log,
+                Some(&raw_request_body),
+                StatusCode::BAD_GATEWAY,
+                &response_json,
+            )
+            .await;
+            (StatusCode::BAD_GATEWAY, Json(response_json)).into_response()
+        }
+    }
+}
+
+async fn claude_pseudo_tool_non_stream_response(
+    _headers: HeaderMap,
+    state: AppState,
+    raw_request_body: String,
+    request_log: serde_json::Value,
+    chat_messages: Vec<ChatMessage>,
+    tool_context: ToolPromptContext,
+    model: String,
+    input_tokens: u32,
+) -> axum::response::Response {
+    let cookie_values = active_cookie_values_round_robin(&state).await;
+    if cookie_values.is_empty() {
+        let response_json =
+            json!({"type":"error","error":{"type":"api_error","message":"no cookies configured"}});
+        append_proxy_audit_record(
+            &state.settings,
+            "/v1/messages",
+            &request_log,
+            Some(&raw_request_body),
+            StatusCode::BAD_GATEWAY,
+            &response_json,
+        )
+        .await;
+        return (StatusCode::BAD_GATEWAY, Json(response_json)).into_response();
+    }
+
+    match run_pseudo_tool_protocol(
+        &state,
+        &cookie_values,
+        &chat_messages,
+        &tool_context,
+        &model,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let response = build_claude_response(&model, input_tokens, &outcome);
+            let response_json = json!(response);
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/messages",
+                &request_log,
+                Some(&raw_request_body),
+                StatusCode::OK,
+                &response_json,
+            )
+            .await;
+            (StatusCode::OK, Json(response_json)).into_response()
+        }
+        Err(last_err) => {
+            let response_json = json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}});
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/messages",
+                &request_log,
+                Some(&raw_request_body),
+                StatusCode::BAD_GATEWAY,
+                &response_json,
+            )
+            .await;
+            (StatusCode::BAD_GATEWAY, Json(response_json)).into_response()
+        }
+    }
+}
+
+async fn claude_pseudo_tool_stream_response(
+    _headers: HeaderMap,
+    state: AppState,
+    raw_request_body: String,
+    request_log: serde_json::Value,
+    chat_messages: Vec<ChatMessage>,
+    tool_context: ToolPromptContext,
+    model: String,
+    input_tokens: u32,
+) -> axum::response::Response {
+    let cookie_values = active_cookie_values_round_robin(&state).await;
+    if cookie_values.is_empty() {
+        let response_json =
+            json!({"type":"error","error":{"type":"api_error","message":"no cookies configured"}});
+        append_proxy_audit_record(
+            &state.settings,
+            "/v1/messages",
+            &request_log,
+            Some(&raw_request_body),
+            StatusCode::BAD_GATEWAY,
+            &response_json,
+        )
+        .await;
+        return (StatusCode::BAD_GATEWAY, Json(response_json)).into_response();
+    }
+
+    match run_pseudo_tool_protocol(
+        &state,
+        &cookie_values,
+        &chat_messages,
+        &tool_context,
+        &model,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/messages",
+                &request_log,
+                Some(&raw_request_body),
+                StatusCode::OK,
+                &json!({"stream":true,"status":"started","pseudo_tool_protocol":true}),
+            )
+            .await;
+
+            let message_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
+            let events =
+                build_claude_buffered_stream_events(&message_id, &model, input_tokens, &outcome);
+            Sse::new(stream::iter(events)).into_response()
+        }
+        Err(last_err) => {
+            let response_json = json!({"type":"error","error":{"type":"api_error","message":format!("upstream failure: {last_err}")}});
+            append_proxy_audit_record(
+                &state.settings,
+                "/v1/messages",
+                &request_log,
+                Some(&raw_request_body),
+                StatusCode::BAD_GATEWAY,
+                &response_json,
+            )
+            .await;
+            (StatusCode::BAD_GATEWAY, Json(response_json)).into_response()
+        }
+    }
+}
+
+async fn run_pseudo_tool_protocol(
     state: &AppState,
     cookie_values: &[String],
     chat_messages: &[ChatMessage],
+    tool_context: &ToolPromptContext,
     model: &str,
-    requested_tool_names: &[String],
-    forced_tool_name: Option<&str>,
-    input_tokens: u32,
-) -> axum::response::Response {
-    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
-    let model_owned = model.to_string();
-    let state = state.clone();
-    let cookie_values = cookie_values.to_vec();
-    let chat_messages = chat_messages.to_vec();
-    let requested_tool_names = requested_tool_names.to_vec();
-    let forced_tool_name = forced_tool_name.map(|s| s.to_string());
+) -> Result<PseudoToolRunOutcome, String> {
+    let mut last_err = String::from("unknown upstream error");
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
-    tokio::spawn(async move {
-        for event in immediate_text_prelude_events(
-            msg_id.clone(),
-            model_owned.clone(),
-            input_tokens,
-        ) {
-            if tx.send(event).await.is_err() {
-                return;
-            }
-        }
+    for cookie in cookie_values {
+        let mut retry_failure: Option<ValidationFailure> = None;
 
-        let mut last_err = String::from("unknown upstream error");
-
-        for cookie in cookie_values {
-            let (allowed_tool_ids, forced_tool_id) =
-                match resolve_tool_selection_for_cookie(
-                    &state.http_client,
-                    &state.settings,
-                    &cookie,
-                    &requested_tool_names,
-                    forced_tool_name.as_deref(),
-                )
-                .await
-                {
-                    Ok(selection) => selection,
-                    Err(err) => {
-                        let err_msg = onyx_client::format_error_chain(&err);
-                        let cookie_fp = crate::cookie_manager::fingerprint(&cookie);
-                        error!(
-                            endpoint = "/v1/messages",
-                            mode = "stream+tools",
-                            cookie = %cookie_fp,
-                            error = %err_msg,
-                            "tool translation failed"
-                        );
-                        let mut cm = state.cookie_manager.write().await;
-                        mark_cookie_failure(&mut cm, &cookie, err_msg.clone());
-                        cm.save();
-                        last_err = err_msg;
-                        continue;
-                    }
-                };
+        for attempt in 1..=pseudo_tools::MAX_PROTOCOL_RETRIES {
+            let injected_messages = pseudo_tools::prepend_protocol_messages(
+                chat_messages,
+                tool_context,
+                retry_failure.as_ref(),
+            );
 
             match onyx_client::full_chat(
                 &state.http_client,
                 &state.settings,
-                &cookie,
-                &chat_messages,
-                &model_owned,
-                allowed_tool_ids.as_deref(),
-                forced_tool_id,
+                cookie,
+                &injected_messages,
+                model,
             )
             .await
             {
-                Ok((content, _thinking)) => {
-                    let mut cm = state.cookie_manager.write().await;
-                    cm.mark_call_success(&cookie);
-                    cm.save();
-
-                    let (tool_calls, remaining_text) =
-                        onyx_client::extract_tool_calls_from_text(&content);
-
-                    let events = if !tool_calls.is_empty() {
-                        build_claude_tool_use_followup_events(
-                            input_tokens,
-                            remaining_text,
-                            tool_calls,
-                        )
-                    } else {
-                        build_claude_text_followup_events(input_tokens, content)
-                    };
-
-                    for event in events {
-                        if tx.send(event).await.is_err() {
-                            return;
+                Ok((content, thinking)) => {
+                    match pseudo_tools::parse_pseudo_tool_response(&content, tool_context) {
+                        Ok(response) => {
+                            let mut cm = state.cookie_manager.write().await;
+                            cm.mark_call_success(cookie);
+                            cm.save();
+                            return Ok(PseudoToolRunOutcome { response, thinking });
+                        }
+                        Err(err) if attempt < pseudo_tools::MAX_PROTOCOL_RETRIES => {
+                            retry_failure = Some(err);
+                        }
+                        Err(err) => {
+                            last_err = format!(
+                                "invalid pseudo tool output after {} attempts: {} ({})",
+                                pseudo_tools::MAX_PROTOCOL_RETRIES,
+                                err.code,
+                                err.message
+                            );
+                            break;
                         }
                     }
-                    return;
                 }
                 Err(err) => {
                     let err_msg = onyx_client::format_error_chain(&err);
-                    let cookie_fp = crate::cookie_manager::fingerprint(&cookie);
+                    let cookie_fp = crate::cookie_manager::fingerprint(cookie);
                     error!(
-                        endpoint = "/v1/messages",
-                        mode = "stream+tools",
+                        endpoint = "pseudo_tool_protocol",
                         cookie = %cookie_fp,
                         error = %err_msg,
-                        "claude stream+tools upstream failed"
+                        "upstream pseudo tool protocol call failed"
                     );
                     let mut cm = state.cookie_manager.write().await;
-                    mark_cookie_failure(&mut cm, &cookie, err_msg.clone());
+                    mark_cookie_failure(&mut cm, cookie, err_msg.clone());
                     cm.save();
                     last_err = err_msg;
+                    break;
                 }
             }
         }
+    }
 
-        for event in build_claude_text_followup_events(
-            input_tokens,
-            format!("upstream failure: {last_err}"),
-        ) {
-            if tx.send(event).await.is_err() {
-                return;
-            }
-        }
-    });
-
-    let sse_stream = stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|event| (Ok::<_, Infallible>(event), rx))
-    });
-    Sse::new(sse_stream).into_response()
+    Err(last_err)
 }
 
-fn immediate_message_start_event(msg_id: String, model: String, input_tokens: u32) -> Event {
-    Event::default().event("message_start").data(
-        serde_json::to_string(&ClaudeStreamMessageStart {
-            type_field: "message_start",
-            message: ClaudeStreamMessageMeta {
-                id: msg_id,
-                type_field: "message",
-                role: "assistant",
-                content: vec![],
-                model,
-                stop_reason: None,
-                usage: ClaudeUsage {
-                    input_tokens,
-                    output_tokens: 0,
-                },
+fn build_openai_assistant_message(
+    outcome: &PseudoToolRunOutcome,
+    include_reasoning: bool,
+) -> AssistantMessage {
+    let reasoning_content = if include_reasoning && !outcome.thinking.is_empty() {
+        Some(outcome.thinking.clone())
+    } else {
+        None
+    };
+
+    match &outcome.response {
+        ParsedPseudoToolResponse::Final { content } => AssistantMessage {
+            role: "assistant",
+            content: content.clone(),
+            reasoning_content,
+            tool_calls: None,
+        },
+        ParsedPseudoToolResponse::Action {
+            tool_name,
+            action_input,
+        } => AssistantMessage {
+            role: "assistant",
+            content: String::new(),
+            reasoning_content,
+            tool_calls: Some(vec![build_openai_tool_call(tool_name, action_input, None)]),
+        },
+    }
+}
+
+fn build_openai_tool_call(
+    tool_name: &str,
+    action_input: &serde_json::Value,
+    index: Option<u32>,
+) -> crate::models::AssistantToolCall {
+    crate::models::AssistantToolCall {
+        id: format!("call_{}", uuid::Uuid::new_v4().as_simple()),
+        kind: "function",
+        function: crate::models::AssistantToolCallFunction {
+            name: tool_name.to_string(),
+            arguments: serde_json::to_string(action_input).unwrap_or_else(|_| String::from("{}")),
+        },
+        index,
+    }
+}
+
+fn build_openai_buffered_stream_events(
+    chat_id: &str,
+    model: &str,
+    created: u64,
+    include_reasoning: bool,
+    outcome: &PseudoToolRunOutcome,
+) -> Vec<Result<Event, Infallible>> {
+    let mut events = Vec::new();
+
+    let role_chunk = ChatCompletionChunk {
+        id: chat_id.to_string(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: ChunkDelta {
+                role: Some("assistant"),
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
             },
-        })
-        .unwrap_or_default(),
-    )
+            finish_reason: None,
+        }],
+    };
+    events.push(Ok(
+        Event::default().data(serde_json::to_string(&role_chunk).unwrap_or_default())
+    ));
+
+    if include_reasoning && !outcome.thinking.is_empty() {
+        let reasoning_chunk = ChatCompletionChunk {
+            id: chat_id.to_string(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: None,
+                    content: None,
+                    reasoning_content: Some(outcome.thinking.clone()),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+        };
+        events.push(Ok(
+            Event::default().data(serde_json::to_string(&reasoning_chunk).unwrap_or_default())
+        ));
+    }
+
+    match &outcome.response {
+        ParsedPseudoToolResponse::Final { content } => {
+            if !content.is_empty() {
+                let content_chunk = ChatCompletionChunk {
+                    id: chat_id.to_string(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.to_string(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: None,
+                            content: Some(content.clone()),
+                            reasoning_content: None,
+                            tool_calls: None,
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                events.push(Ok(Event::default()
+                    .data(serde_json::to_string(&content_chunk).unwrap_or_default())));
+            }
+
+            let done_chunk = ChatCompletionChunk {
+                id: chat_id.to_string(),
+                object: "chat.completion.chunk",
+                created,
+                model: model.to_string(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("stop"),
+                }],
+            };
+            events.push(Ok(
+                Event::default().data(serde_json::to_string(&done_chunk).unwrap_or_default())
+            ));
+        }
+        ParsedPseudoToolResponse::Action {
+            tool_name,
+            action_input,
+        } => {
+            let tool_chunk = ChatCompletionChunk {
+                id: chat_id.to_string(),
+                object: "chat.completion.chunk",
+                created,
+                model: model.to_string(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: Some(vec![build_openai_tool_call(
+                            tool_name,
+                            action_input,
+                            Some(0),
+                        )]),
+                    },
+                    finish_reason: None,
+                }],
+            };
+            events.push(Ok(
+                Event::default().data(serde_json::to_string(&tool_chunk).unwrap_or_default())
+            ));
+
+            let done_chunk = ChatCompletionChunk {
+                id: chat_id.to_string(),
+                object: "chat.completion.chunk",
+                created,
+                model: model.to_string(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("tool_calls"),
+                }],
+            };
+            events.push(Ok(
+                Event::default().data(serde_json::to_string(&done_chunk).unwrap_or_default())
+            ));
+        }
+    }
+
+    events
 }
 
-fn immediate_text_prelude_events(msg_id: String, model: String, input_tokens: u32) -> Vec<Event> {
-    vec![
-        immediate_message_start_event(msg_id, model, input_tokens),
-        Event::default().event("content_block_start").data(
-            serde_json::to_string(&ClaudeStreamContentBlockStart {
+fn build_claude_response(
+    model: &str,
+    input_tokens: u32,
+    outcome: &PseudoToolRunOutcome,
+) -> ClaudeMessagesResponse {
+    let (content, stop_reason) = match &outcome.response {
+        ParsedPseudoToolResponse::Final { content } => (
+            vec![ClaudeContentBlock {
+                type_field: "text",
+                text: Some(content.clone()),
+                id: None,
+                name: None,
+                input: None,
+            }],
+            "end_turn",
+        ),
+        ParsedPseudoToolResponse::Action {
+            tool_name,
+            action_input,
+        } => (
+            vec![ClaudeContentBlock {
+                type_field: "tool_use",
+                text: None,
+                id: Some(format!("toolu_{}", uuid::Uuid::new_v4().as_simple())),
+                name: Some(tool_name.clone()),
+                input: Some(action_input.clone()),
+            }],
+            "tool_use",
+        ),
+    };
+
+    ClaudeMessagesResponse {
+        id: format!("msg_{}", uuid::Uuid::new_v4().as_simple()),
+        type_field: "message",
+        role: "assistant",
+        content,
+        model: model.to_string(),
+        stop_reason,
+        usage: ClaudeUsage {
+            input_tokens,
+            output_tokens: 0,
+        },
+    }
+}
+
+fn build_claude_buffered_stream_events(
+    message_id: &str,
+    model: &str,
+    input_tokens: u32,
+    outcome: &PseudoToolRunOutcome,
+) -> Vec<Result<Event, Infallible>> {
+    let mut events = Vec::new();
+
+    let message_start = ClaudeStreamMessageStart {
+        type_field: "message_start",
+        message: ClaudeStreamMessageMeta {
+            id: message_id.to_string(),
+            type_field: "message",
+            role: "assistant",
+            content: vec![],
+            model: model.to_string(),
+            stop_reason: None,
+            usage: ClaudeUsage {
+                input_tokens,
+                output_tokens: 0,
+            },
+        },
+    };
+    events.push(Ok(Event::default()
+        .event("message_start")
+        .data(serde_json::to_string(&message_start).unwrap_or_default())));
+
+    match &outcome.response {
+        ParsedPseudoToolResponse::Final { content } => {
+            let block_start = ClaudeStreamContentBlockStart {
                 type_field: "content_block_start",
                 index: 0,
                 content_block: ClaudeContentBlock {
@@ -2165,103 +2193,75 @@ fn immediate_text_prelude_events(msg_id: String, model: String, input_tokens: u3
                     name: None,
                     input: None,
                 },
-            })
-            .unwrap_or_default(),
-        ),
-    ]
-}
+            };
+            events.push(Ok(Event::default()
+                .event("content_block_start")
+                .data(serde_json::to_string(&block_start).unwrap_or_default())));
 
-fn build_claude_tool_use_followup_events(
-    input_tokens: u32,
-    remaining_text: String,
-    tool_calls: Vec<onyx_client::ParsedToolCall>,
-) -> Vec<Event> {
-    let mut events: Vec<Event> = Vec::new();
-    let mut block_index: u8 = 1;
-
-    if !remaining_text.is_empty() {
-        events.push(
-            Event::default().event("content_block_delta").data(
-                serde_json::to_string(&ClaudeStreamContentBlockDelta {
+            if !content.is_empty() {
+                let delta = ClaudeStreamContentBlockDelta {
                     type_field: "content_block_delta",
                     index: 0,
                     delta: ClaudeTextDelta {
                         type_field: "text_delta",
-                        text: remaining_text,
+                        text: content.clone(),
                     },
-                })
-                .unwrap_or_default(),
-            ),
-        );
-        events.push(
-            Event::default().event("content_block_stop").data(
-                serde_json::to_string(&ClaudeStreamContentBlockStop {
-                    type_field: "content_block_stop",
-                    index: 0,
-                })
-                .unwrap_or_default(),
-            ),
-        );
-    } else {
-        events.push(
-            Event::default().event("content_block_stop").data(
-                serde_json::to_string(&ClaudeStreamContentBlockStop {
-                    type_field: "content_block_stop",
-                    index: 0,
-                })
-                .unwrap_or_default(),
-            ),
-        );
-    }
+                };
+                events.push(Ok(Event::default()
+                    .event("content_block_delta")
+                    .data(serde_json::to_string(&delta).unwrap_or_default())));
+            }
 
-    for tc in &tool_calls {
-        let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
-        let tool_input_json = serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string());
+            let block_stop = ClaudeStreamContentBlockStop {
+                type_field: "content_block_stop",
+                index: 0,
+            };
+            events.push(Ok(Event::default()
+                .event("content_block_stop")
+                .data(serde_json::to_string(&block_stop).unwrap_or_default())));
 
-        events.push(
-            Event::default().event("content_block_start").data(
-                serde_json::to_string(&ClaudeStreamContentBlockStart {
-                    type_field: "content_block_start",
-                    index: block_index,
-                    content_block: ClaudeContentBlock {
-                        type_field: "tool_use",
-                        text: None,
-                        id: Some(tool_use_id),
-                        name: Some(tc.name.clone()),
-                        input: Some(json!({})),
-                    },
-                })
-                .unwrap_or_default(),
-            ),
-        );
-        events.push(
-            Event::default().event("content_block_delta").data(
-                serde_json::to_string(&json!({
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": tool_input_json,
-                    }
-                }))
-                .unwrap_or_default(),
-            ),
-        );
-        events.push(
-            Event::default().event("content_block_stop").data(
-                serde_json::to_string(&ClaudeStreamContentBlockStop {
-                    type_field: "content_block_stop",
-                    index: block_index,
-                })
-                .unwrap_or_default(),
-            ),
-        );
-        block_index += 1;
-    }
+            let message_delta = ClaudeStreamMessageDelta {
+                type_field: "message_delta",
+                delta: ClaudeStopDelta {
+                    stop_reason: "end_turn",
+                },
+                usage: ClaudeUsage {
+                    input_tokens,
+                    output_tokens: 0,
+                },
+            };
+            events.push(Ok(Event::default()
+                .event("message_delta")
+                .data(serde_json::to_string(&message_delta).unwrap_or_default())));
+        }
+        ParsedPseudoToolResponse::Action {
+            tool_name,
+            action_input,
+        } => {
+            let block_start = ClaudeStreamContentBlockStart {
+                type_field: "content_block_start",
+                index: 0,
+                content_block: ClaudeContentBlock {
+                    type_field: "tool_use",
+                    text: None,
+                    id: Some(format!("toolu_{}", uuid::Uuid::new_v4().as_simple())),
+                    name: Some(tool_name.clone()),
+                    input: Some(action_input.clone()),
+                },
+            };
+            events.push(Ok(Event::default()
+                .event("content_block_start")
+                .data(serde_json::to_string(&block_start).unwrap_or_default())));
 
-    events.push(
-        Event::default().event("message_delta").data(
-            serde_json::to_string(&ClaudeStreamMessageDelta {
+            let block_stop = ClaudeStreamContentBlockStop {
+                type_field: "content_block_stop",
+                index: 0,
+            };
+            events.push(Ok(Event::default()
+                .event("content_block_stop")
+                .data(serde_json::to_string(&block_stop).unwrap_or_default())));
+
+            let message_delta = ClaudeStreamMessageDelta {
                 type_field: "message_delta",
                 delta: ClaudeStopDelta {
                     stop_reason: "tool_use",
@@ -2270,86 +2270,21 @@ fn build_claude_tool_use_followup_events(
                     input_tokens,
                     output_tokens: 0,
                 },
-            })
-            .unwrap_or_default(),
-        ),
-    );
-    events.push(
-        Event::default().event("message_stop").data(
-            serde_json::to_string(&ClaudeStreamMessageStop {
-                type_field: "message_stop",
-            })
-            .unwrap_or_default(),
-        ),
-    );
-    events
-}
-
-fn build_claude_text_followup_events(input_tokens: u32, content: String) -> Vec<Event> {
-    let mut events: Vec<Event> = Vec::new();
-    if !content.is_empty() {
-        events.push(Event::default().event("content_block_delta").data(
-            serde_json::to_string(&ClaudeStreamContentBlockDelta {
-                type_field: "content_block_delta",
-                index: 0,
-                delta: ClaudeTextDelta {
-                    type_field: "text_delta",
-                    text: content,
-                },
-            })
-            .unwrap_or_default(),
-        ));
+            };
+            events.push(Ok(Event::default()
+                .event("message_delta")
+                .data(serde_json::to_string(&message_delta).unwrap_or_default())));
+        }
     }
 
-    events.push(Event::default().event("content_block_stop").data(
-        serde_json::to_string(&ClaudeStreamContentBlockStop {
-            type_field: "content_block_stop",
-            index: 0,
-        })
-        .unwrap_or_default(),
-    ));
-
-    events.push(Event::default().event("message_delta").data(
-        serde_json::to_string(&ClaudeStreamMessageDelta {
-            type_field: "message_delta",
-            delta: ClaudeStopDelta {
-                stop_reason: "end_turn",
-            },
-            usage: ClaudeUsage {
-                input_tokens,
-                output_tokens: 0,
-            },
-        })
-        .unwrap_or_default(),
-    ));
-
-    events.push(Event::default().event("message_stop").data(
-        serde_json::to_string(&ClaudeStreamMessageStop {
-            type_field: "message_stop",
-        })
-        .unwrap_or_default(),
-    ));
+    let message_stop = ClaudeStreamMessageStop {
+        type_field: "message_stop",
+    };
+    events.push(Ok(Event::default()
+        .event("message_stop")
+        .data(serde_json::to_string(&message_stop).unwrap_or_default())));
 
     events
-}
-
-async fn resolve_tool_selection_for_cookie(
-    http_client: &reqwest::Client,
-    settings: &Settings,
-    cookie: &str,
-    requested_tool_names: &[String],
-    forced_tool_name: Option<&str>,
-) -> anyhow::Result<(Option<Vec<i64>>, Option<i64>)> {
-    if requested_tool_names.is_empty() && forced_tool_name.is_none() {
-        return Ok((None, None));
-    }
-
-    let available_tools = onyx_client::fetch_available_tools(http_client, settings, cookie).await?;
-    Ok(onyx_client::resolve_tool_selection_by_name(
-        &available_tools,
-        requested_tool_names,
-        forced_tool_name,
-    ))
 }
 
 fn ensure_authorized(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
@@ -2393,7 +2328,10 @@ fn classify_cookie_failure(reason: &str) -> CookieFailureKind {
         "额度耗尽",
     ];
 
-    if permanent_markers.iter().any(|marker| lower.contains(marker)) {
+    if permanent_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
         CookieFailureKind::Permanent
     } else {
         CookieFailureKind::Temporary
@@ -2437,7 +2375,10 @@ fn format_std_error_chain(err: &(dyn StdError + 'static)) -> String {
         return String::from("unknown error");
     }
 
-    let root_cause = chain.last().cloned().unwrap_or_else(|| String::from("unknown error"));
+    let root_cause = chain
+        .last()
+        .cloned()
+        .unwrap_or_else(|| String::from("unknown error"));
     format!(
         "{} | chain: {} | root_cause: {}",
         chain[0],
@@ -2452,215 +2393,6 @@ fn truncate_for_error(input: &str, max_chars: usize) -> String {
     }
     let truncated = input.chars().take(max_chars).collect::<String>();
     format!("{truncated}...")
-}
-
-#[derive(Debug)]
-struct LocalToolCall {
-    name: String,
-    arguments: String,
-}
-
-fn maybe_build_local_tool_call_from_chat_request(req: &ChatCompletionRequest) -> Option<LocalToolCall> {
-    let tool_names = req.requested_tool_names();
-    let user_message = req
-        .messages
-        .iter()
-        .rev()
-        .find(|msg| msg.role.eq_ignore_ascii_case("user"))
-        .map(|msg| msg.content.as_str())?;
-    maybe_build_local_tool_call(&tool_names, user_message)
-}
-
-fn maybe_build_local_tool_call_from_claude_request(
-    req: &ClaudeMessagesRequest,
-) -> Option<LocalToolCall> {
-    if req.has_tool_result_message() {
-        return None;
-    }
-
-    let tool_names = req.requested_tool_names();
-    let user_message = req
-        .messages
-        .iter()
-        .rev()
-        .find(|msg| msg.role.eq_ignore_ascii_case("user"))
-        .map(|msg| msg.content.as_str())?;
-    maybe_build_local_tool_call(&tool_names, user_message)
-}
-
-fn maybe_build_local_tool_call(tool_names: &[String], user_message: &str) -> Option<LocalToolCall> {
-    if looks_like_embedded_source_dump(user_message) {
-        return None;
-    }
-
-    let supports_bash = tool_names.iter().any(|name| name.eq_ignore_ascii_case("bash"));
-    let supports_write = tool_names
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case("write") || name.eq_ignore_ascii_case("write_file"));
-
-    if supports_bash
-        && let Some(command) = extract_bash_command_from_text(user_message)
-    {
-        return Some(LocalToolCall {
-            name: "bash".to_string(),
-            arguments: json!({"command": command}).to_string(),
-        });
-    }
-
-    let path = extract_file_path_from_text(user_message)?;
-    let content = extract_write_content_from_text(user_message)?;
-
-    if supports_write {
-        return Some(LocalToolCall {
-            name: "write".to_string(),
-            arguments: json!({"filePath": path, "content": content}).to_string(),
-        });
-    }
-
-    if supports_bash {
-        let parent = std::path::Path::new(&path)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| ".".to_string());
-
-        let command = format!(
-            "mkdir -p \"{}\" && printf %s \"{}\" > \"{}\"",
-            escape_shell_double_quotes(&parent),
-            escape_shell_double_quotes(&content),
-            escape_shell_double_quotes(&path)
-        );
-        return Some(LocalToolCall {
-            name: "bash".to_string(),
-            arguments: json!({"command": command}).to_string(),
-        });
-    }
-
-    None
-}
-
-fn extract_bash_command_from_text(input: &str) -> Option<String> {
-    for marker in ["run:", "run：", "command:", "command：", "cmd:", "cmd："] {
-        if let Some(pos) = input.to_ascii_lowercase().find(marker) {
-            let start = pos + marker.len();
-            let command = input[start..]
-                .trim()
-                .trim_matches('`')
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim();
-            if !command.is_empty() {
-                return Some(command.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-fn extract_file_path_from_text(input: &str) -> Option<String> {
-    if let Some(start) = input.find("/home/") {
-        let mut candidate = String::new();
-        for ch in input[start..].chars() {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-') {
-                candidate.push(ch);
-            } else {
-                break;
-            }
-        }
-
-        if candidate.contains('.') && !candidate.ends_with('/') {
-            return Some(candidate);
-        }
-
-        let dir = if candidate.ends_with('/') {
-            candidate
-        } else if let Some(pos) = candidate.rfind('/') {
-            candidate[..=pos].to_string()
-        } else {
-            return None;
-        };
-
-        let filename = extract_filename_from_text(input)?;
-        return Some(format!("{dir}{filename}"));
-    }
-
-    extract_filename_from_text(input)
-}
-
-fn extract_filename_from_text(input: &str) -> Option<String> {
-    let mut current = String::new();
-    let mut candidates = Vec::new();
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-            current.push(ch);
-        } else {
-            if current.contains('.') {
-                candidates.push(current.clone());
-            }
-            current.clear();
-        }
-    }
-    if current.contains('.') {
-        candidates.push(current);
-    }
-    candidates.into_iter().find(|name| !name.starts_with('/'))
-}
-
-fn extract_write_content_from_text(input: &str) -> Option<String> {
-    if let Some(start) = input.find("写入") {
-        let content = input[start + "写入".len()..].trim();
-        if !content.is_empty() {
-            return Some(content.trim_matches('"').trim_matches('\'').to_string());
-        }
-    }
-
-    let lower = input.to_ascii_lowercase();
-    for marker in ["with content", "content"] {
-        if let Some(pos) = lower.find(marker) {
-            let raw = input[pos + marker.len()..].trim();
-            let cleaned = raw
-                .trim_start_matches([':', '：', '=', '-', ' '])
-                .trim_start_matches("is ")
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim();
-            if !cleaned.is_empty() {
-                return Some(cleaned.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-fn escape_shell_double_quotes(input: &str) -> String {
-    input.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn looks_like_embedded_source_dump(input: &str) -> bool {
-    if input.contains("<path>") || input.contains("<content>") {
-        return true;
-    }
-
-    let normalized = input.replace("\\n", "\n");
-    let mut annotated_lines = 0;
-    for line in normalized.lines() {
-        let trimmed = line.trim_start();
-        let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
-        if digit_count > 0 {
-            let rest = &trimmed[digit_count..];
-            if rest.starts_with('#') && rest.contains('|') {
-                annotated_lines += 1;
-                if annotated_lines >= 2 {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
 }
 
 fn now_ts() -> u64 {
@@ -2735,210 +2467,70 @@ async fn append_proxy_audit_record(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        classify_cookie_failure, immediate_message_start_event,
-        maybe_build_local_tool_call_from_chat_request,
-        maybe_build_local_tool_call_from_claude_request, next_round_robin_offset,
-        rotate_cookie_values,
-    };
+    use super::{classify_cookie_failure, next_round_robin_offset, rotate_cookie_values};
     use crate::cookie_manager::CookieFailureKind;
-    use crate::models::{ChatCompletionRequest, ClaudeMessagesRequest};
     use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn classify_cookie_failure_marks_auth_error_as_permanent() {
         let reason = "onyx auth failed: 401 | chain: ...";
-        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Permanent);
+        assert_eq!(
+            classify_cookie_failure(reason),
+            CookieFailureKind::Permanent
+        );
     }
 
     #[test]
     fn classify_cookie_failure_marks_rate_limit_as_permanent() {
         let reason = "onyx send-chat-message HTTP 429: rate limit exceeded";
-        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Permanent);
+        assert_eq!(
+            classify_cookie_failure(reason),
+            CookieFailureKind::Permanent
+        );
     }
 
     #[test]
     fn classify_cookie_failure_marks_usage_limit_exceeded_as_permanent() {
         let reason = "empty upstream response: {\"error\":\"An unexpected error occurred while processing your request. Please try again later.\",\"stack_trace\":\"Traceback ... UsageLimitExceededError: Usage limit exceeded for llm_cost_cents: current usage 847.9482500000003, limit 800.0\"}";
-        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Permanent);
+        assert_eq!(
+            classify_cookie_failure(reason),
+            CookieFailureKind::Permanent
+        );
     }
 
     #[test]
     fn classify_cookie_failure_marks_llm_cost_cents_limit_exceeded_as_permanent() {
         let reason = "empty upstream response: UsageLimitExceededError: Usage limit exceeded for llm_cost_cents";
-        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Permanent);
+        assert_eq!(
+            classify_cookie_failure(reason),
+            CookieFailureKind::Permanent
+        );
     }
 
     #[test]
     fn classify_cookie_failure_marks_transport_error_as_temporary() {
         let reason = "failed to call send-chat-message | chain: connection refused";
-        assert_eq!(classify_cookie_failure(reason), CookieFailureKind::Temporary);
-    }
-
-    #[test]
-    fn local_bash_tool_call_is_generated_for_create_and_write_request() {
-        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "claude-opus-4-6",
-            "messages": [
-                {"role": "user", "content": "帮我在 /home/nonewhite/Download/1234.txt 中写入 123"}
-            ],
-            "tools": [
-                {"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}
-            ],
-            "stream": false
-        }))
-        .expect("request should deserialize");
-
-        let tool_call = maybe_build_local_tool_call_from_chat_request(&req).expect("tool call expected");
-        assert_eq!(tool_call.name, "bash");
-        assert!(tool_call.arguments.contains("/home/nonewhite/Download/1234.txt"));
-        assert!(tool_call.arguments.contains("printf %s \\\"123\\\""));
-    }
-
-    #[test]
-    fn local_bash_tool_call_handles_no_whitespace_chinese_path_prompt() {
-        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "claude-opus-4-6",
-            "messages": [
-                {"role": "user", "content": "在/home/nonewhite/Download/中创建一个1234.txt文件并且在里面写入123"}
-            ],
-            "tools": [
-                {"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}
-            ],
-            "stream": false
-        }))
-        .expect("request should deserialize");
-
-        let tool_call = maybe_build_local_tool_call_from_chat_request(&req).expect("tool call expected");
-        assert_eq!(tool_call.name, "bash");
-        assert!(tool_call.arguments.contains("/home/nonewhite/Download/1234.txt"));
-    }
-
-    #[test]
-    fn claude_messages_can_generate_local_tool_use_call() {
-        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
-            "model": "claude-opus-4-6",
-            "messages": [
-                {"role": "user", "content": "帮我在 /home/nonewhite/Download/1234.txt 中写入 123"}
-            ],
-            "tools": [
-                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}}
-            ],
-            "max_tokens": 1024,
-            "stream": false
-        }))
-        .expect("request should deserialize");
-
-        let tool_call = maybe_build_local_tool_call_from_claude_request(&req).expect("tool call expected");
-        assert_eq!(tool_call.name, "bash");
-        assert!(tool_call.arguments.contains("/home/nonewhite/Download/1234.txt"));
-    }
-
-    #[test]
-    fn claude_messages_single_bash_tool_request_generates_command_tool_call() {
-        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
-            "model": "claude-opus-4-6",
-            "messages": [
-                {"role": "user", "content": "Use the bash tool to run: pwd"}
-            ],
-            "tools": [
-                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}}
-            ],
-            "max_tokens": 1024,
-            "stream": false
-        }))
-        .expect("request should deserialize");
-
-        let tool_call = maybe_build_local_tool_call_from_claude_request(&req).expect("tool call expected");
-        assert_eq!(tool_call.name, "bash");
-        assert!(tool_call.arguments.contains("\"command\":\"pwd\""));
-    }
-
-    #[test]
-    fn claude_messages_english_create_file_prefers_write_tool_when_available() {
-        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
-            "model": "claude-opus-4-6",
-            "messages": [
-                {"role": "user", "content": "Please create 1234.txt with content 1234"}
-            ],
-            "tools": [
-                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}},
-                {"name": "write", "description": "write file", "input_schema": {"type": "object"}}
-            ],
-            "max_tokens": 1024,
-            "stream": false
-        }))
-        .expect("request should deserialize");
-
-        let tool_call = maybe_build_local_tool_call_from_claude_request(&req).expect("tool call expected");
-        assert_eq!(tool_call.name, "write");
-        assert!(tool_call.arguments.contains("\"filePath\":\"1234.txt\""));
-        assert!(tool_call.arguments.contains("\"content\":\"1234\""));
-    }
-
-    #[test]
-    fn claude_messages_with_tool_result_does_not_generate_local_tool_call() {
-        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
-            "model": "claude-opus-4-6",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_1",
-                            "content": "run: pwd"
-                        }
-                    ]
-                }
-            ],
-            "tools": [
-                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}}
-            ],
-            "max_tokens": 1024,
-            "stream": true
-        }))
-        .expect("request should deserialize");
-
-        let tool_call = maybe_build_local_tool_call_from_claude_request(&req);
-        assert!(
-            tool_call.is_none(),
-            "local tool call must be skipped when request already contains tool_result blocks"
-        );
-    }
-
-    #[test]
-    fn claude_messages_embedded_source_dump_does_not_generate_local_tool_call() {
-        let req: ClaudeMessagesRequest = serde_json::from_value(serde_json::json!({
-            "model": "claude-opus-4-6",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "<path>/tmp/foo.rs</path>\n<content>\n718#YW|    assert!(\n719#PP|        rendered.contains(\"Use the bash tool to run: pwd\"),\n720#ZH|        \"should explicitly mark root cause\"\n721#PJ|    );\n</content>"
-                }
-            ],
-            "tools": [
-                {"name": "bash", "description": "run shell", "input_schema": {"type": "object"}}
-            ],
-            "max_tokens": 1024,
-            "stream": true
-        }))
-        .expect("request should deserialize");
-
-        let tool_call = maybe_build_local_tool_call_from_claude_request(&req);
-        assert!(
-            tool_call.is_none(),
-            "embedded source dumps must not trigger local tool synthesis"
+        assert_eq!(
+            classify_cookie_failure(reason),
+            CookieFailureKind::Temporary
         );
     }
 
     #[test]
     fn rotate_cookie_values_applies_round_robin_offset() {
-        let values = vec!["cookie-a".to_string(), "cookie-b".to_string(), "cookie-c".to_string()];
+        let values = vec![
+            "cookie-a".to_string(),
+            "cookie-b".to_string(),
+            "cookie-c".to_string(),
+        ];
         let rotated = rotate_cookie_values(values, 1);
         assert_eq!(
             rotated,
-            vec!["cookie-b".to_string(), "cookie-c".to_string(), "cookie-a".to_string()]
+            vec![
+                "cookie-b".to_string(),
+                "cookie-c".to_string(),
+                "cookie-a".to_string()
+            ]
         );
     }
 
@@ -2949,14 +2541,5 @@ mod tests {
         assert_eq!(next_round_robin_offset(&counter, 3), 1);
         assert_eq!(next_round_robin_offset(&counter, 3), 2);
         assert_eq!(next_round_robin_offset(&counter, 3), 0);
-    }
-
-    #[test]
-    fn immediate_message_start_event_uses_expected_claude_shape() {
-        let event = immediate_message_start_event("msg_123".to_string(), "claude-opus-4.6".to_string(), 42);
-        let rendered = format!("{:?}", event);
-        assert!(rendered.contains("message_start"));
-        assert!(rendered.contains("msg_123"));
-        assert!(rendered.contains("claude-opus-4.6"));
     }
 }
