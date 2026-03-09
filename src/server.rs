@@ -3,6 +3,7 @@ use std::error::Error as StdError;
 use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::error;
 
 use crate::{
@@ -62,6 +64,8 @@ struct RefreshResponse {
     refreshed: usize,
     failed: usize,
 }
+
+const COOKIE_REFRESH_INTERVAL_SECS: u64 = 3600;
 
 #[derive(Debug, Deserialize)]
 struct AddCookieRequest {
@@ -160,6 +164,40 @@ pub fn build_router(state: AppState) -> Router {
             get(auth_login_page_handler).post(auth_login_handler),
         )
         .with_state(state)
+}
+
+pub fn spawn_cookie_refresh_task(state: AppState) -> JoinHandle<()> {
+    spawn_cookie_refresh_task_with_interval(
+        state,
+        Duration::from_secs(COOKIE_REFRESH_INTERVAL_SECS),
+    )
+}
+
+fn spawn_cookie_refresh_task_with_interval(state: AppState, interval: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let initial = refresh_all_cookies(&state).await;
+        error!(
+            endpoint = "/api/cookies/refresh",
+            total = initial.total,
+            refreshed = initial.refreshed,
+            failed = initial.failed,
+            "startup cookie refresh completed"
+        );
+
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let result = refresh_all_cookies(&state).await;
+            error!(
+                endpoint = "/api/cookies/refresh",
+                total = result.total,
+                refreshed = result.refreshed,
+                failed = result.failed,
+                "scheduled cookie refresh completed"
+            );
+        }
+    })
 }
 
 async fn root_handler() -> Json<serde_json::Value> {
@@ -1041,6 +1079,10 @@ async fn refresh_cookies_handler(
     State(state): State<AppState>,
 ) -> Result<Json<RefreshResponse>, StatusCode> {
     ensure_authorized(&headers, &state)?;
+    Ok(Json(refresh_all_cookies(&state).await))
+}
+
+async fn refresh_all_cookies(state: &AppState) -> RefreshResponse {
     let mut refreshed = 0usize;
     let mut failed = 0usize;
 
@@ -1074,37 +1116,13 @@ async fn refresh_cookies_handler(
                     truncate_for_error(&body, 240)
                 );
                 error!(endpoint = "/api/cookies/refresh", error = %reason, "cookie refresh http failure");
-                let kind = classify_cookie_failure(&reason);
-                if matches!(kind, CookieFailureKind::Permanent) {
-                    entry.exhausted = true;
-                    entry.temporary_failures = 0;
-                    entry.cooldown_until_ts = None;
-                } else {
-                    entry.temporary_failures = entry.temporary_failures.saturating_add(1);
-                    if entry.temporary_failures >= 3 {
-                        entry.cooldown_until_ts = Some(now_ts().saturating_add(120));
-                        entry.temporary_failures = 0;
-                    }
-                }
-                entry.last_error = Some(reason);
+                apply_cookie_refresh_failure(entry, &reason);
                 failed += 1;
             }
             Err(err) => {
                 let reason = format_std_error_chain(&err);
                 error!(endpoint = "/api/cookies/refresh", error = %reason, "cookie refresh transport failure");
-                let kind = classify_cookie_failure(&reason);
-                if matches!(kind, CookieFailureKind::Permanent) {
-                    entry.exhausted = true;
-                    entry.temporary_failures = 0;
-                    entry.cooldown_until_ts = None;
-                } else {
-                    entry.temporary_failures = entry.temporary_failures.saturating_add(1);
-                    if entry.temporary_failures >= 3 {
-                        entry.cooldown_until_ts = Some(now_ts().saturating_add(120));
-                        entry.temporary_failures = 0;
-                    }
-                }
-                entry.last_error = Some(reason);
+                apply_cookie_refresh_failure(entry, &reason);
                 failed += 1;
             }
         }
@@ -1112,11 +1130,27 @@ async fn refresh_cookies_handler(
 
     cm.save();
 
-    Ok(Json(RefreshResponse {
+    RefreshResponse {
         total,
         refreshed,
         failed,
-    }))
+    }
+}
+
+fn apply_cookie_refresh_failure(entry: &mut crate::cookie_manager::CookieEntry, reason: &str) {
+    let kind = classify_cookie_failure(reason);
+    if matches!(kind, CookieFailureKind::Permanent) {
+        entry.exhausted = true;
+        entry.temporary_failures = 0;
+        entry.cooldown_until_ts = None;
+    } else {
+        entry.temporary_failures = entry.temporary_failures.saturating_add(1);
+        if entry.temporary_failures >= 3 {
+            entry.cooldown_until_ts = Some(now_ts().saturating_add(120));
+            entry.temporary_failures = 0;
+        }
+    }
+    entry.last_error = Some(reason.to_string());
 }
 
 /// Anthropic Claude-compatible Messages endpoint.
@@ -2619,14 +2653,26 @@ async fn append_proxy_audit_record(
 #[cfg(test)]
 mod tests {
     use super::{
-        PseudoToolRunOutcome, build_claude_response, build_claude_tool_use_stream_payloads,
-        build_openai_assistant_message, classify_cookie_failure, next_round_robin_offset,
-        rotate_cookie_values,
+        PseudoToolRunOutcome, StatusCode, build_claude_response,
+        build_claude_tool_use_stream_payloads, build_openai_assistant_message, build_state,
+        classify_cookie_failure, next_round_robin_offset, refresh_all_cookies,
+        rotate_cookie_values, spawn_cookie_refresh_task_with_interval,
     };
+    use crate::config::Settings;
     use crate::cookie_manager::CookieFailureKind;
     use crate::pseudo_tools::ParsedPseudoToolResponse;
+    use axum::{
+        Router,
+        extract::State,
+        http::header::{COOKIE, SET_COOKIE},
+        response::IntoResponse,
+        routing::post,
+    };
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     #[test]
     fn classify_cookie_failure_marks_auth_error_as_permanent() {
@@ -2839,5 +2885,115 @@ mod tests {
             "ls /home/nonewhite/Download/ 2>&1 || echo 'DIR_NOT_FOUND'"
         );
         assert_eq!(parsed["description"], "Check if Download directory exists");
+    }
+
+    async fn spawn_refresh_server(refreshed_cookie: &'static str) -> (String, oneshot::Sender<()>) {
+        async fn refresh_handler(
+            State(cookie_value): State<&'static str>,
+            headers: axum::http::HeaderMap,
+        ) -> impl IntoResponse {
+            let cookie_header = headers
+                .get(COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
+            if !cookie_header.contains("fastapiusersauth=") {
+                return (StatusCode::UNAUTHORIZED, "missing auth cookie").into_response();
+            }
+
+            (
+                StatusCode::OK,
+                [(
+                    SET_COOKIE,
+                    format!("fastapiusersauth={cookie_value}; Path=/; HttpOnly"),
+                )],
+                "ok",
+            )
+                .into_response()
+        }
+
+        let app = Router::new()
+            .route("/api/auth/refresh", post(refresh_handler))
+            .with_state(refreshed_cookie);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refresh test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("refresh test server should run");
+        });
+
+        (format!("http://{}", addr), shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn refresh_all_cookies_updates_stored_cookie_value() {
+        let (base_url, shutdown_tx) = spawn_refresh_server("refreshed-cookie").await;
+        let cookie_file = std::env::temp_dir().join(format!(
+            "rust-proxy-cookie-refresh-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let state = build_state(Settings {
+            onyx_base_url: base_url,
+            onyx_auth_cookie: "stale-cookie".to_string(),
+            api_key: None,
+            cookie_persist_path: cookie_file.to_string_lossy().to_string(),
+            ..Settings::default()
+        })
+        .expect("state should build");
+
+        let result = refresh_all_cookies(&state).await;
+        assert_eq!(result.total, 1);
+        assert_eq!(result.refreshed, 1);
+        assert_eq!(result.failed, 0);
+
+        let mut cm = state.cookie_manager.write().await;
+        let entries = cm.entries_mut();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "refreshed-cookie");
+        assert!(entries[0].last_refresh_ts.is_some());
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_file(cookie_file);
+    }
+
+    #[tokio::test]
+    async fn auto_refresh_task_runs_immediately_on_startup() {
+        let (base_url, shutdown_tx) = spawn_refresh_server("startup-refreshed-cookie").await;
+        let cookie_file = std::env::temp_dir().join(format!(
+            "rust-proxy-cookie-refresh-startup-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let state = build_state(Settings {
+            onyx_base_url: base_url,
+            onyx_auth_cookie: "startup-stale-cookie".to_string(),
+            api_key: None,
+            cookie_persist_path: cookie_file.to_string_lossy().to_string(),
+            ..Settings::default()
+        })
+        .expect("state should build");
+
+        let handle =
+            spawn_cookie_refresh_task_with_interval(state.clone(), Duration::from_secs(3600));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut cm = state.cookie_manager.write().await;
+        let entries = cm.entries_mut();
+        assert_eq!(entries[0].value, "startup-refreshed-cookie");
+        assert!(entries[0].last_refresh_ts.is_some());
+        drop(cm);
+
+        handle.abort();
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_file(cookie_file);
     }
 }

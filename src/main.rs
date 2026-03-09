@@ -1,5 +1,5 @@
 use rust_proxy::config::Settings;
-use rust_proxy::server::{build_router, build_state};
+use rust_proxy::server::{build_router, build_state, spawn_cookie_refresh_task};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -19,6 +19,7 @@ async fn main() {
     info!("onyx base url: {}", settings.onyx_base_url);
 
     let state = build_state(settings).expect("failed to build app state");
+    let _cookie_refresh_task = spawn_cookie_refresh_task(state.clone());
 
     axum::serve(listener, build_router(state))
         .await
